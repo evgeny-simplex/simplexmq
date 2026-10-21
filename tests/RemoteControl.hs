@@ -17,11 +17,12 @@ import Data.Either (isLeft)
 import Data.List (stripPrefix)
 import Data.Maybe (isJust, isNothing)
 import Data.Time.Clock.System (SystemTime (..))
-import Network.TLS (Backend)
+import Network.TLS (Backend (..))
 import PipeBackend (pipeBackends)
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
 import Simplex.Messaging.Transport (TSbChainKeys (..), cGet)
+import qualified Simplex.RemoteControl.Client as CC (RCCtrlClient (action))
 import qualified Simplex.RemoteControl.Client as HC (RCHostClient (action))
 import qualified Simplex.RemoteControl.Client as RC
 import Simplex.RemoteControl.Invitation
@@ -51,7 +52,8 @@ remoteControlTests = do
   describe "Session transport" $ do
     it "should fail when known host CA differs" testKnownHostMismatch
     it "should report backend failure on both sides" testBackendFailure
-    it "should cancel session waiting for backend" testCancelWaitingBackend
+    it "should cancel host session waiting for backend" testCancelWaitingBackend
+    it "should cancel controller session waiting for backend" testCancelCtrlWaitingBackend
 
 
 testSignedInvitation :: IO RCSignedInvitation
@@ -235,13 +237,16 @@ testKnownHostMismatch = do
   (signedInv, hc, r) <- runRight $ RC.connectRCHost drg hp' (J.String "app") (pure ctrlBackend)
   inv <- maybe (fail "bad invite") pure $ verifySignedInvitation signedInv
   (cc, r') <- runRight $ RC.connectRCCtrl drg inv Nothing (J.String "app") (pure hostBackend)
-  atomically (takeTMVar r) >>= \case
-    Left _ -> pure ()
+  takeStep r >>= \case
+    Left (RCEException e) -> e `shouldContain` "UnknownCa"
+    Left e -> expectationFailure $ "unexpected error: " <> show e
     Right _ -> expectationFailure "controller accepted a host with another CA"
   -- the host finishes its handshake before the controller checks the host certificate
-  atomically (takeTMVar r') >>= \case
+  takeStep r' >>= \case
     Left _ -> pure ()
     Right (_, tls, _) -> tryAny (cGet tls 1) >>= either (\_ -> pure ()) (`shouldBe` "")
+  backendSend ctrlBackend "x" `shouldThrow` anyIOException
+  backendSend hostBackend "x" `shouldThrow` anyIOException
   RC.cancelCtrlClient cc
   RC.cancelHostClient hc
 
@@ -250,10 +255,10 @@ testBackendFailure = do
   drg <- C.newRandom
   hp <- RC.newRCHostPairing drg
   (signedInv, _, r) <- runRight $ RC.connectRCHost drg hp (J.String "app") noBackend
-  atomically (takeTMVar r) >>= expectBackendError
+  takeStep r >>= expectBackendError
   inv <- maybe (fail "bad invite") pure $ verifySignedInvitation signedInv
   (_, r') <- runRight $ RC.connectRCCtrl drg inv Nothing (J.String "app") noBackend
-  atomically (takeTMVar r') >>= expectBackendError
+  takeStep r' >>= expectBackendError
   where
     noBackend :: IO Backend
     noBackend = throwIO $ userError "no data channel"
@@ -271,13 +276,36 @@ testCancelWaitingBackend = do
   backend <- newEmptyTMVarIO
   let getBackend = atomically (putTMVar waiting ()) >> atomically (takeTMVar backend)
   (_, hc, r) <- runRight $ RC.connectRCHost drg hp (J.String "app") getBackend
-  atomically $ takeTMVar waiting
+  takeStep waiting
   RC.cancelHostClient hc
   waitCatch (HC.action hc) >>= \case
     Left err -> fromException err `shouldBe` Just AsyncCancelled
     Right () -> expectationFailure "session ended without cancellation"
   atomically (isEmptyTMVar r) `shouldReturn` True
-  atomically (isEmptyTMVar backend) `shouldReturn` True
+  (b, _) <- pipeBackends
+  atomically $ putTMVar backend b
+  atomically (isEmptyTMVar backend) `shouldReturn` False
+
+testCancelCtrlWaitingBackend :: IO ()
+testCancelCtrlWaitingBackend = do
+  drg <- C.newRandom
+  inv <- testSignedInvitation >>= maybe (fail "bad invite") pure . verifySignedInvitation
+  waiting <- newEmptyTMVarIO
+  backend <- newEmptyTMVarIO
+  let getBackend = atomically (putTMVar waiting ()) >> atomically (takeTMVar backend)
+  (cc, r) <- runRight $ RC.connectRCCtrl drg inv Nothing (J.String "app") getBackend
+  takeStep waiting
+  RC.cancelCtrlClient cc
+  waitCatch (CC.action cc) >>= \case
+    Left err -> fromException err `shouldBe` Just AsyncCancelled
+    Right () -> expectationFailure "session ended without cancellation"
+  atomically (isEmptyTMVar r) `shouldReturn` True
+  (b, _) <- pipeBackends
+  atomically $ putTMVar backend b
+  atomically (isEmptyTMVar backend) `shouldReturn` False
+
+takeStep :: TMVar a -> IO a
+takeStep v = timeout 5000000 (atomically $ takeTMVar v) >>= maybe (fail "timeout") pure
 
 runCtrl :: TVar ChaChaDRG -> RCHostPairing -> MVar RCSignedInvitation -> Backend -> IO (Async RCHostPairing)
 runCtrl drg hp invVar backend = async . runRight $ do
