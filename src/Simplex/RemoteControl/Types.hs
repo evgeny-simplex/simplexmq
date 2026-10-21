@@ -171,8 +171,7 @@ data RCCtrlPairing = RCCtrlPairing
   { caKey :: C.APrivateSignKey,
     caCert :: X.SignedCertificate,
     ctrlFingerprint :: C.KeyHash, -- long-term identity of connected remote controller
-    idPubKey :: C.PublicKeyEd25519,
-    dhPrivKey :: C.PrivateKeyX25519
+    idPubKey :: C.PublicKeyEd25519
   }
 
 data RCHostKeys = RCHostKeys

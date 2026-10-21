@@ -44,6 +44,7 @@ remoteControlTests = do
   describe "New controller/host pairing" $ do
     it "should connect to new pairing" testNewPairing
     it "should connect to existing pairing" testExistingPairing
+    it "should connect with a pairing restored from its stored fields" testStoredCtrlPairing
 
 testPreferAddress :: Spec
 testPreferAddress = do
@@ -222,6 +223,23 @@ testExistingPairing = do
               timeout 5000000 (waitBoth ctrl3 host3) >>= \case
                 Nothing -> fail "timeout"
                 Just _ -> pure ()
+
+testStoredCtrlPairing :: IO ()
+testStoredCtrlPairing = do
+  drg <- C.newRandom
+  invVar <- newEmptyMVar
+  hp <- RC.newRCHostPairing drg
+  ctrl <- runCtrl drg hp invVar
+  host <- runHostURI drg Nothing =<< takeMVar invVar
+  timeout 5000000 (waitBoth ctrl host) >>= \case
+    Nothing -> fail "timeout"
+    Just (hp', RCCtrlPairing {caKey, caCert, ctrlFingerprint, idPubKey}) -> do
+      let restored = RCCtrlPairing {caKey, caCert, ctrlFingerprint, idPubKey}
+      ctrl' <- runCtrl drg hp' invVar
+      host' <- runHostURI drg (Just restored) =<< takeMVar invVar
+      timeout 5000000 (waitBoth ctrl' host') >>= \case
+        Nothing -> fail "timeout"
+        Just _ -> pure ()
 
 testInvitationTimestamp :: IO ()
 testInvitationTimestamp = do
