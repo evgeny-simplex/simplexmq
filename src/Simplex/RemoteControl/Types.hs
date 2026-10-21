@@ -106,7 +106,7 @@ instance StrEncoding RCErrorType where
     where
       textP = T.unpack . safeDecodeUtf8 <$> (A.space *> A.takeByteString)
 
--- * Discovery
+-- * Version
 
 data RCPVersion
 

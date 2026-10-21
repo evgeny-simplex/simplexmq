@@ -64,7 +64,6 @@ remoteControlTests = do
     it "should cancel host session waiting for backend" testCancelWaitingBackend
     it "should cancel controller session waiting for backend" testCancelCtrlWaitingBackend
 
-
 testSignedInvitation :: IO RCSignedInvitation
 testSignedInvitation = do
   drg <- C.newRandom
@@ -178,6 +177,7 @@ testNewPairing = do
   waitCatch (HC.action hc) >>= \case
     Left err -> fromException err `shouldBe` Just AsyncCancelled
     Right () -> pure ()
+  backendSend ctrlBackend "x" `shouldThrow` anyIOException
 
   timeout 5000000 (waitBoth ctrlSessId hostSessId) >>= \case
     Just (sessId, sessId') -> sessId `shouldBe` sessId'
@@ -361,9 +361,12 @@ testRejectSession = do
   timeout 5000000 (waitCatch (CC.action cc)) >>= \case
     Just (Right ()) -> pure ()
     r_ -> expectationFailure $ "controller session did not end: " <> show r_
+  backendSend hostBackend "x" `shouldThrow` anyIOException
   takeStep r >>= \case
     Left e -> expectationFailure $ "unexpected error: " <> show e
-    Right _ -> pure ()
+    Right (_, _, r2) -> takeStep r2 >>= \case
+      Left _ -> pure ()
+      Right _ -> expectationFailure "controller session started without host HELLO"
   RC.cancelHostClient hc
 
 -- starts both sides and returns once the controller (mobile) side has its TLS session
@@ -381,9 +384,12 @@ startPair = do
 
 testConfirmTwice :: IO ()
 testConfirmTwice = do
-  (hc, cc, _, _, _) <- startPair
+  (hc, cc, r'', _, _) <- startPair
   timeout 5000000 (RC.confirmCtrlSession cc False >> RC.confirmCtrlSession cc False) `shouldReturn` Just ()
   timeout 5000000 (RC.confirmCtrlSession cc True) `shouldReturn` Just ()
+  takeStep r'' >>= \case
+    Left e -> e `shouldBe` RCERejected
+    Right _ -> expectationFailure "later confirmation replaced the first answer"
   RC.cancelHostClient hc
 
 testConfirmAfterCancel :: IO ()
