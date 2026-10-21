@@ -265,7 +265,12 @@ connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca} 
         r' <- newEmptyTMVarIO
         whenM (atomically $ tryPutTMVar r $ Right (tlsUniq tls, tls, r')) $ do
           logDebug "Waiting for session confirmation"
-          whenM (atomically $ readTMVar confirmSession) $ runSession tls r' `putRCError` r'
+          atomically (readTMVar confirmSession) >>= \case
+            True -> runSession tls r' `putRCError` r'
+            False -> do
+              -- release second putTMVar in confirmCtrlSession
+              void . atomically $ takeTMVar confirmSession
+              throwE (RCEInternal "session rejected") `putRCError` r'
       where
         connectBackend cfg = bracketOnError getBackend TLS.backendClose $ connectTLSClientBackend cfg ca
         runSession tls r' = do

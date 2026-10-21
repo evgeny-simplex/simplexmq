@@ -52,6 +52,7 @@ remoteControlTests = do
   describe "Session transport" $ do
     it "should fail when known host CA differs" testKnownHostMismatch
     it "should report backend failure on both sides" testBackendFailure
+    it "should end session when session code is rejected" testRejectSession
     it "should cancel host session waiting for backend" testCancelWaitingBackend
     it "should cancel controller session waiting for backend" testCancelCtrlWaitingBackend
 
@@ -303,6 +304,29 @@ testCancelCtrlWaitingBackend = do
   (b, _) <- pipeBackends
   atomically $ putTMVar backend b
   atomically (isEmptyTMVar backend) `shouldReturn` False
+
+testRejectSession :: IO ()
+testRejectSession = do
+  drg <- C.newRandom
+  hp <- RC.newRCHostPairing drg
+  (ctrlBackend, hostBackend) <- pipeBackends
+  (signedInv, hc, r) <- runRight $ RC.connectRCHost drg hp (J.String "app") (pure ctrlBackend)
+  inv <- maybe (fail "bad invite") pure $ verifySignedInvitation signedInv
+  (cc, r') <- runRight $ RC.connectRCCtrl drg inv Nothing (J.String "app") (pure hostBackend)
+  takeStep r' >>= \case
+    Left e -> expectationFailure $ "unexpected error: " <> show e
+    Right (_, _, r'') -> do
+      timeout 5000000 (RC.confirmCtrlSession cc False) `shouldReturn` Just ()
+      takeStep r'' >>= \case
+        Left e -> e `shouldBe` RCEInternal "session rejected"
+        Right _ -> expectationFailure "session started after rejection"
+  timeout 5000000 (waitCatch (CC.action cc)) >>= \case
+    Just (Right ()) -> pure ()
+    r_ -> expectationFailure $ "controller session did not end: " <> show r_
+  takeStep r >>= \case
+    Left e -> expectationFailure $ "unexpected error: " <> show e
+    Right _ -> pure ()
+  RC.cancelHostClient hc
 
 takeStep :: TMVar a -> IO a
 takeStep v = timeout 5000000 (atomically $ takeTMVar v) >>= maybe (fail "timeout") pure
