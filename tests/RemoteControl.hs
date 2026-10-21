@@ -15,6 +15,7 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import Data.Either (isLeft)
 import Data.List (stripPrefix)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (isJust, isNothing)
 import Data.Time.Clock.System (SystemTime (..))
 import Network.TLS (Backend (..))
@@ -22,12 +23,15 @@ import PipeBackend (pipeBackends)
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
 import Simplex.Messaging.Transport (TSbChainKeys (..), cGet)
+import Simplex.Messaging.Transport.Client (TransportClientConfig (..), connectTLSClientBackend, defaultTransportClientConfig)
+import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
 import qualified Simplex.RemoteControl.Client as CC (RCCtrlClient (action))
 import qualified Simplex.RemoteControl.Client as HC (RCHostClient (action))
 import qualified Simplex.RemoteControl.Client as RC
 import Simplex.RemoteControl.Invitation
   ( RCInvitation (..),
     RCSignedInvitation (..),
+    RCVerifiedInvitation (..),
     invitationTsValid,
     signInvitation,
     verifySignedInvitation,
@@ -51,6 +55,7 @@ remoteControlTests = do
     it "should connect with a pairing restored from its stored fields" testStoredCtrlPairing
   describe "Session transport" $ do
     it "should fail when known host CA differs" testKnownHostMismatch
+    it "should fail when host certificate is not signed by known host CA" testForgedHostChain
     it "should report backend failure on both sides" testBackendFailure
     it "should end session when session code is rejected" testRejectSession
     it "should return from repeated confirmation" testConfirmTwice
@@ -252,6 +257,32 @@ testKnownHostMismatch = do
   backendSend ctrlBackend "x" `shouldThrow` anyIOException
   backendSend hostBackend "x" `shouldThrow` anyIOException
   RC.cancelCtrlClient cc
+  RC.cancelHostClient hc
+
+testForgedHostChain :: IO ()
+testForgedHostChain = do
+  drg <- C.newRandom
+  (_, hostCaCert) <- genCredentials drg Nothing (1, 24) "ca"
+  attackerCa@(attackerCaKeys, _) <- genCredentials drg Nothing (1, 24) "ca"
+  forgedLeaf <- genCredentials drg (Just attackerCa) (1, 24) "localhost"
+  let (hostCaFingerprint, forgedCreds) = tlsCredentials (forgedLeaf :| [(attackerCaKeys, hostCaCert)])
+  hp <- RC.newRCHostPairing drg
+  (ctrlBackend, hostBackend) <- pipeBackends
+  let hp' = hp {knownHost = Just KnownHostPairing {hostFingerprint = hostCaFingerprint}}
+  (signedInv, hc, r) <- runRight $ RC.connectRCHost drg hp' (J.String "app") (pure ctrlBackend)
+  RCInvitation {ca} <- maybe (fail "bad invite") (\(RCVerifiedInvitation inv) -> pure inv) $ verifySignedInvitation signedInv
+  let cfg = defaultTransportClientConfig {clientCredentials = Just forgedCreds}
+  host <- async $ tryAny $ connectTLSClientBackend cfg ca hostBackend
+  takeStep r >>= \case
+    Left (RCEException e) -> e `shouldContain` "InvalidSignature"
+    Left e -> expectationFailure $ "unexpected error: " <> show e
+    Right _ -> expectationFailure "controller accepted a host certificate not signed by the known host CA"
+  -- the host finishes its handshake before the controller checks the host certificate
+  timeout 5000000 (wait host) >>= \case
+    Nothing -> expectationFailure "host handshake did not end"
+    Just (Left _) -> pure ()
+    Just (Right tls) -> timeout 5000000 (tryAny (cGet tls 1)) >>= maybe (expectationFailure "host read did not end") (either (\_ -> pure ()) (`shouldBe` ""))
+  backendSend ctrlBackend "x" `shouldThrow` anyIOException
   RC.cancelHostClient hc
 
 testBackendFailure :: IO ()

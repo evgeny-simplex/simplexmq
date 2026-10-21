@@ -57,6 +57,7 @@ import Simplex.Messaging.Transport.Buffer (peekBuffered)
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), connectTLSClientBackend, defaultTransportClientConfig)
 import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
 import Simplex.Messaging.Transport.Server (connectTLSServerBackend, mkTransportServerConfig)
+import Simplex.Messaging.Transport.Shared (x509validate)
 import Simplex.Messaging.Util
 import Simplex.Messaging.Version
 import Simplex.RemoteControl.Invitation
@@ -127,13 +128,16 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
     tlsHooks r knownHost_ hostCAHash =
       def
         { TLS.onNewHandshake = \_ -> atomically $ isNothing <$> tryReadTMVar r,
-          TLS.onClientCertificate = \(X.CertificateChain chain) ->
+          TLS.onClientCertificate = \cc@(X.CertificateChain chain) ->
             case chain of
               [_leaf, ca] -> do
                 let kh = certFingerprint ca
                     accept = maybe True (\h -> hostFingerprint h == kh) knownHost_
                 if accept
-                  then atomically (putTMVar hostCAHash kh) $> TLS.CertificateUsageAccept
+                  then
+                    x509validate ca ("", B.empty) cc >>= \case
+                      [] -> atomically (putTMVar hostCAHash kh) $> TLS.CertificateUsageAccept
+                      errs -> pure . TLS.CertificateUsageReject . TLS.CertificateRejectOther $ show errs
                   else pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
               _ ->
                 pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
