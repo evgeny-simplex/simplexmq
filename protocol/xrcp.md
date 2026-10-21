@@ -1,4 +1,4 @@
-Version 1, 2024-06-22
+Version 2, 2026-10-21
 
 # SimpleX Remote Control Protocol
 
@@ -11,7 +11,7 @@ Version 1, 2024-06-22
   - [Establishing TLS connection](#establishing-tls-connection)
   - [Session verification and protocol negotiation](#session-verification-and-protocol-negotiation)
   - [Controller/host session operation](#controllerhost-session-operation)
-- [Key agreement for announcement packet and for session](#key-agreement-for-announcement-packet-and-for-session)
+- [Key agreement for session](#key-agreement-for-session)
 - [Threat model](#threat-model)
 
 ## Abstract
@@ -56,22 +56,20 @@ Protocol consists of four phases:
 
 The invitation to the first session between host and controller pair MUST be shared out-of-band, to establish a long term identity keys/certificates of the controller to host device.
 
-The subsequent sessions can be announced via an application-defined site-local multicast group, e.g. `224.0.0.251` (also used in mDNS/bonjour) and an application-defined port (SimpleX Chat uses 5227).
+Invitations to subsequent sessions are delivered by the application over its own authenticated channel, for example a messaging connection created during the first session.
 
 The session invitation contains this data:
 - supported version range for remote control protocol.
 - application-specific information, e.g. device name, application name and supported version range, settings, etc.
 - session start time in seconds since epoch.
-- if multicast is used, counter of announce packets sent by controller.
-- network address (ipv4 address and port) of the controller.
-- CA TLS certificate fingerprint of the controller - this is part of long term identity of the controller established during the first session, and repeated in the subsequent session announcements.
-- Session Ed25519 public key used to verify the announcement and commands - this mitigates the compromise of the long term signature key, as the controller will have to sign each command with this key first.
-- Long-term Ed25519 public key used to verify the announcement and commands - this is part of the long term controller identity.
-- Session X25519 DH key to agree session encryption (both for multicast announcement and for commands and responses in TLS), as described in https://datatracker.ietf.org/doc/draft-josefsson-ntruprime-hybrid/. The new keys are used for each session, and if client key is already available (from the previous session), the computed shared secret will be used to encrypt the announcement multicast packet. The out-of-band invitation is unencrypted. DH public key and KEM encapsulation key are sent unencrypted. NaCL crypto_box is used for encryption.
+- CA TLS certificate fingerprint of the controller - this is part of long term identity of the controller established during the first session, and repeated in the subsequent session invitations.
+- Session Ed25519 public key used to verify the invitation and commands - this mitigates the compromise of the long term signature key, as the controller will have to sign each command with this key first.
+- Long-term Ed25519 public key used to verify the invitation and commands - this is part of the long term controller identity.
+- Session X25519 DH key to agree session encryption for commands and responses in TLS, as described in https://datatracker.ietf.org/doc/draft-josefsson-ntruprime-hybrid/. New keys are used for each session. The invitation is unencrypted and contains only the DH public key. The KEM encapsulation key is sent in the encrypted part of the host HELLO block. NaCL crypto_box is used for encryption.
 
-Host application decrypts (except the first session) and validates the invitation:
+Host application validates the invitation:
 - Session signature is valid.
-- Timestamp of a multicast announcement is not earlier than 3660 seconds before and not later than 3600 seconds after the current time of the host. The host ignores announcements outside of this interval and continues listening.
+- Timestamp of an invitation delivered by the application is not earlier than 3660 seconds before and not later than 3600 seconds after the current time of the host. The host ignores invitations outside of this interval.
 - Long-term key signature is valid.
 - Long-term CA and signature key are the same as in the first session.
 - Some version in the offered range is supported.
@@ -79,10 +77,8 @@ Host application decrypts (except the first session) and validates the invitatio
 OOB session invitation is a URI with this syntax:
 
 ```abnf
-sessionAddressUri = "xrcp:/" encodedCAFingerprint "@" host ":" port "#/?" qsParams
+sessionAddressUri = "xrcp:/" encodedCAFingerprint "#/?" qsParams
 encodedCAFingerprint = base64url
-host = <ipv4 or ipv6 address> ; in textual form, RFC4001
-port = 1*DIGIT ; uint16
 qsParams = param *("&" param)
 param = versionRangeParam / appInfoParam / sessionTsParam /
         sessPubKeyParam / idPubKeyParam / dhPubKeyParam /
@@ -99,23 +95,13 @@ idSignatureParam = "idsig=" base64url ; signs the URI with this param removed
 base64url = <base64url encoded binary> ; RFC4648, section 5
 ```
 
-Multicast session announcement is a binary encoded packet with this syntax:
-
-```abnf
-sessionAddressPacket = dhPubKey nonce encrypted(unpaddedSize sessionAddress packetPad)
-dhPubKey = length x509encoded ; same as announced
-nonce = 24*24 OCTET ; NaCl 192-bit nonce, no length prefix
-sessionAddress = sessionAddressUri ; length given by unpaddedSize
-length = 1*1 OCTET ; for binary data up to 255 bytes
-largeLength = 2*2 OCTET ; for binary data up to 65535 bytes
-packetPad = <pad invitation content to 900 bytes before encryption>
-```
+Version 2 removed the controller address from the URI. A host rejects version 1 URIs.
 
 ### Establishing TLS connection
 
 Both controller and host use 2-element certificate chains with unique self-signed CA root representing long-term identities. Leaf certificates aren't stored and instead generated on each session start.
 
-A controller runs a TCP server to avoid opening listening socket on a host, which might create an attack vector. A controller keeps no sensitive data to be exposed this way.
+The TLS connection runs over a reliable, ordered byte stream provided by the application, for example a WebRTC data channel. The controller is the TLS server and the host is the TLS client. How the stream is established is out of scope of this protocol.
 
 During TLS handshake, parties validate certificate chains against previously known (from invitation or storage) CA fingerprints. The fingerprints MUST be the same as in the invitation and in the subsequent connections.
 
@@ -124,6 +110,8 @@ During TLS handshake, parties validate certificate chains against previously kno
 Once TLS session is established, both the host and controller devices present a "session security code" to the user. The session security code must be a digest of tlsunique channel binding. As it is computed as a digest of the TLS handshake for both the controller and the host, it will validate that the same TLS certificates are used on both sides, and that the same TLS session is established, mitigating the possibility of MITM attack in the connection.
 
 To verify the session, the user matches the codes (e.g., visually or via QR code scan) and confirms the session on the host device.
+
+The host application answers the confirmation once, without blocking the session task. The first answer is used and later answers are ignored. If the host rejects the session, it closes the connection with the REJECTED error and does not send HELLO.
 
 The user MUST verify the first session with a new controller. The host stores the long-term identity of the controller (CA fingerprint and Ed25519 public key) only after this session is verified. A controller with the stored long-term identity is a known controller.
 
@@ -134,7 +122,7 @@ Once the session is confirmed, the host sends HELLO block to the controller.
 XRCP blocks inside TLS are padded to 16384 bytes.
 
 Host HELLO block must contain:
-- new session DH key - used to compute new shared secret with the controller keys from the announcement.
+- new session DH key - generated for each session, used to compute the shared secret with the controller DH key from the invitation.
 - encrypted part of HELLO block (JSON object), containing:
   - chosen protocol version.
   - host CA TLS certificate fingerprint - part of host long term identity - must match the one presented in TLS handshake and the previous sessions, otherwise the connection is terminated.
@@ -208,7 +196,7 @@ JTD schema for the encrypted part of controller HELLO block `ctrlHelloJSON`:
 
 Controller `hello` block and all subsequent protocol messages are encrypted with the chain keys derived from the hybrid key (see key exchange below) - that is why controller hello block does not include nonce. That provides forward secrecy within the XRCP session. Receiving this `hello` block allows host to compute the same hybrid keys and to derive the same chain keys.
 
-Once the controller replies HELLO to the valid host HELLO block, it should stop accepting new TCP connections.
+Each invitation is used for one TLS connection.
 
 ### Controller/host session operation
 
@@ -239,15 +227,13 @@ encLength32 = 4*4 OCTET ; uint32, includes authTag
 
 If the command or response includes attachment, its hash must be included in command/response and validated.
 
-## Key agreement for announcement packet and for session
+## Key agreement for session
 
-Initial announcement is shared out-of-band (URI with xrcp scheme), and it is not encrypted.
+The session invitation is not encrypted. It is shared out-of-band or over an application channel (URI with xrcp scheme).
 
-This announcement contains only DH keys, as KEM key is too large to include in QR code, which are used to agree encryption key for host HELLO block. The host HELLO block will contain DH key in plaintext part and KEM encapsulation (public) key in encrypted part, that will be used to determine the shared secret (using SHA3-256 over concatenated DH shared secret and KEM encapsulated secret) to derive keys for controller HELLO response (that contains KEM ciphertext in plaintext part) and subsequent session commands and responses.
+The invitation contains only the DH key, as KEM key is too large to include in QR code, which is used to agree encryption key for host HELLO block. The host HELLO block will contain DH key in plaintext part and KEM encapsulation (public) key in encrypted part, that will be used to determine the shared secret (using SHA3-256 over concatenated DH shared secret and KEM encapsulated secret) to derive keys for controller HELLO response (that contains KEM ciphertext in plaintext part) and subsequent session commands and responses.
 
-During the next session the announcement is sent via encrypted multicast block. The shared key for this announcement and for host HELLO block is determined using the KEM shared secret from the previous session and DH shared secret computed using the host DH key from the previous session and the new controller DH key from the announcement.
-
-For the session, the shared secret is computed again using the KEM shared secret encapsulated by the controller using the new KEM key from the host HELLO block and DH shared secret computed using the host DH key from HELLO block and the new controller DH key from the announcement.
+For each session, the host generates a new DH key. The shared secret is computed using the KEM shared secret encapsulated by the controller using the new KEM key from the host HELLO block and DH shared secret computed using the host DH key from HELLO block and the controller DH key from the invitation.
 
 In pseudo-code:
 
@@ -260,22 +246,14 @@ kemCiphertext(1) = enc(kemSecret(1), kemEncKey(1))
 // kemEncKey is included in host HELLO, kemCiphertext - in controller HELLO
 kemSecret(1) = dec(kemCiphertext(1), kemDecKey(1))
 
-// multicast announcement for session n
-announcementSecret(n) = dhSecret(n')
-dhSecret(n') = dh(hostHelloDhKey(n - 1), controllerDhKey(n))
-
 // session n
 hostHelloSecret(n) = dhSecret(n)
 sessionSecret(n) = sha3-256(dhSecret(n) || kemSecret(n)) // to encrypt session n data, incl. controller hello
 dhSecret(n) = dh(hostHelloDhKey(n), controllerDhKey(n))
-// controllerDhKey(n) is either from invitation or from multicast announcement
+// controllerDhKey(n) is from the invitation for session n, hostHelloDhKey(n) is new for each session
 kemCiphertext(n) = enc(kemSecret(n), kemEncKey(n))
 kemSecret(n) = dec(kemCiphertext(n), kemDecKey(n))
 ```
-
-If controller fails to store the new host DH key after receiving HELLO block, the encryption will become out of sync and the host won't be able to decrypt the next announcement. To mitigate it, the host should keep the last session DH key and also previous session DH key to try to decrypt the next announcement computing shared secret using both keys (first the new one, and in case it fails - the previous).
-
-To decrypt a multicast announcement, the host should try to decrypt it using the keys of all known (paired) remote controllers.
 
 Once sessionSecret is agreed for the session, it is used to derive two chain keys, to receive and to send messages:
 
@@ -295,7 +273,9 @@ to receive: (rcvKey', sk, nonce) = HKDF(rcvKey, "SimpleXSbChain", 88)
 
 ## Threat model
 
-#### A passive network adversary able to monitor the site-local traffic:
+The byte stream between host and controller is not trusted. Its endpoints, the signaling used to establish it and any relay can be controlled by an adversary. The TLS connection inside it, the session verification and the HELLO blocks provide all the security properties below.
+
+#### A passive network adversary able to monitor the traffic between host and controller:
 
 *can:*
 - observe session times, duration and volume of the transmitted data between host and controller.
@@ -305,7 +285,7 @@ to receive: (rcvKey', sk, nonce) = HKDF(rcvKey, "SimpleXSbChain", 88)
 - substitute the transmitted commands or responses.
 - replay transmitted commands or events from the hosts.
 
-#### An active network adversary able to intercept and substitute the site-local traffic:
+#### An active network adversary able to intercept and substitute the traffic between host and controller:
 
 *can:*
 - prevent host and controller devices from establishing the session
@@ -321,7 +301,7 @@ to receive: (rcvKey', sk, nonce) = HKDF(rcvKey, "SimpleXSbChain", 88)
 *cannot:*
 - compromise host or controller devices.
 
-#### An active adversary with the access to the network who also observed OOB announcement:
+#### An active adversary with the access to the network who also observed OOB invitation:
 
 *can:*
 - connect to controller instead of the host.

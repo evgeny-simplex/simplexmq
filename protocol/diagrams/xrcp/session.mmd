@@ -7,12 +7,12 @@ sequenceDiagram
 note over CI, HI: 1. Session invitation
 CI->>CC: "Link a mobile"
 CC-->>CI: Session invitation URI
-note over CC: Listen for TCP connection
+note over CC: Wait for data channel
 activate CC
 HI->>HC: Session invitation URI
 
 note over CI, HI: 2. Establishing TLS connection
-HC-->>CC: TCP connect
+HC-->>CC: open data channel
 note over CC, HC: TLS handshake
 par
     note over CC: validate client X509 credentials
@@ -31,7 +31,7 @@ alt
     CC-->>HC: controller ERROR
 else
     CC-->>HC: controller HELLO
-    note over CC, HC: update stored keys
+    note over CC, HC: store pairing
 end
 deactivate CC
 
