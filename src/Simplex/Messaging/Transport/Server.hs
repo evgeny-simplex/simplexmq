@@ -22,6 +22,7 @@ module Simplex.Messaging.Transport.Server
     getSocketStats,
     runTransportServer,
     runTransportServerSocket,
+    connectTLSServerBackend,
     runLocalTCPServer,
     startTCPServer,
     loadServerCredential,
@@ -129,6 +130,13 @@ runTransportServerSocket started getSocket threadLabel srvParams cfg server = do
     setupTLS conn = do
       tls <- connectTLS Nothing tCfg srvParams conn
       (False,) <$> getTransportConnection tCfg True (X.CertificateChain []) tls
+
+connectTLSServerBackend :: TransportServerConfig -> T.ServerParams -> T.Backend -> IO (TLS 'TServer)
+connectTLSServerBackend cfg srvParams backend =
+  timeout (tlsSetupTimeout cfg) setupTLS >>= maybe (fail "tls setup timeout") pure
+  where
+    tCfg = serverTransportConfig cfg
+    setupTLS = connectTLS Nothing tCfg srvParams backend >>= getTransportConnection tCfg True (X.CertificateChain [])
 
 runTransportServerSocketState :: Transport c => SocketState -> TMVar Bool -> IO Socket -> String -> T.Supported -> TLSServerCredential -> TransportServerConfig -> (Socket -> (SNICredentialUsed, c 'TServer) -> IO ()) -> IO ()
 runTransportServerSocketState ss started getSocket threadLabel srvSupported srvCreds cfg server =

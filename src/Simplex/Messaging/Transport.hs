@@ -350,9 +350,9 @@ data TLS (p :: TransportPeer) = TLS
 
 type ALPN = ByteString
 
-connectTLS :: T.TLSParams p => Maybe HostName -> TransportConfig -> p -> Socket -> IO T.Context
-connectTLS host_ TransportConfig {logTLSErrors} params sock =
-  E.bracketOnError (T.contextNew sock params) closeTLS $ \ctx ->
+connectTLS :: (T.TLSParams p, T.HasBackend b) => Maybe HostName -> TransportConfig -> p -> b -> IO T.Context
+connectTLS host_ TransportConfig {logTLSErrors} params backend =
+  E.bracketOnError (T.contextNew backend params) closeTLS $ \ctx ->
     logHandshakeErrors (T.handshake ctx) $> ctx
   where
     logHandshakeErrors = if logTLSErrors then (`catchAll` logThrow) else id

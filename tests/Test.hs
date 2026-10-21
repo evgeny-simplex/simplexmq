@@ -14,6 +14,7 @@ import CoreTests.MsgStoreTests
 import CoreTests.RetryIntervalTests
 import CoreTests.SOCKSSettings
 import CoreTests.StoreLogTests
+import CoreTests.TLSBackendTests
 import CoreTests.TSessionSubs
 import CoreTests.UtilTests
 import CoreTests.VersionRangeTests
@@ -92,6 +93,7 @@ main = do
             describe "Encrypted files tests" cryptoFileTests
             describe "Message store tests" msgStoreTests
             describe "SOCKS settings tests" socksSettingsTests
+            describe "TLS over Backend" tlsBackendTests
             describe "Store log tests" storeLogTests
             describe "XFTP store log tests" fileStoreLogTests
             fileExpirationTests

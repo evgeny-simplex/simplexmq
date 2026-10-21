@@ -554,12 +554,14 @@ test-suite simplexmq-test
       CoreTests.RetryIntervalTests
       CoreTests.SOCKSSettings
       CoreTests.StoreLogTests
+      CoreTests.TLSBackendTests
       CoreTests.TSessionSubs
       CoreTests.UtilTests
       CoreTests.VersionRangeTests
       FileDescriptionTests
       RemoteControl
       NamesResolverServer
+      PipeBackend
       RSLVTests
       ServerTests
       SMPAgentClient
@@ -614,6 +616,7 @@ test-suite simplexmq-test
     , crypton-x509
     , crypton-x509-store
     , crypton-x509-validation
+    , data-default
     , directory
     , file-embed >=0.0.10 && <0.1
     , filepath

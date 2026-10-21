@@ -10,6 +10,7 @@
 module Simplex.Messaging.Transport.Client
   ( runTransportClient,
     runTLSTransportClient,
+    connectTLSClientBackend,
     smpClientHandshake,
     defaultSMPPort,
     defaultTcpConnectTimeout,
@@ -193,6 +194,19 @@ runTLSTransportClient tlsParams caStore_ cfg@TransportClientConfig {socksProxy, 
       THIPv6 addr -> SocksAddrIPV6 addr
       THOnionHost h -> SocksAddrDomainName h
       THDomainName h -> SocksAddrDomainName $ B.pack h
+
+-- | The server chain must be pinned by the CA fingerprint.
+-- Only clientCredentials, clientALPN and logTLSErrors of the config are used.
+connectTLSClientBackend :: TransportClientConfig -> C.KeyHash -> T.Backend -> IO (TLS 'TClient)
+connectTLSClientBackend cfg@TransportClientConfig {clientCredentials, clientALPN} caFingerprint backend = do
+  serverCert <- newEmptyTMVarIO
+  clientCredsSent <- newIORef False
+  let tCfg = clientTransportConfig cfg
+      clientParams = mkTLSClientParams defaultSupportedParams Nothing "" "" (Just caFingerprint) clientCredentials clientCredsSent clientALPN False serverCert
+  tls <- connectTLS Nothing tCfg clientParams backend
+  chain <- takePeerCertChain serverCert `E.onException` closeTLS tls
+  sent <- readIORef clientCredsSent
+  getTransportConnection tCfg sent chain tls
 
 connectTCPClient :: HostName -> ServiceName -> IO Socket
 connectTCPClient host port = withSocketsDo $ resolve >>= tryOpen err
