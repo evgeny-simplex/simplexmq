@@ -21,7 +21,6 @@ module Simplex.Messaging.Transport.Server
     newSocketState,
     getSocketStats,
     runTransportServer,
-    runTransportServerSocket,
     connectTLSServerBackend,
     runLocalTCPServer,
     startTCPServer,
@@ -119,17 +118,6 @@ runTransportServerState ss started port srvSupported credential cfg server = run
 
 runTransportServerState_ :: forall c. Transport c => SocketState -> TMVar Bool -> ServiceName -> T.Supported -> TLSServerCredential -> TransportServerConfig -> (Socket -> (SNICredentialUsed, c 'TServer) -> IO ()) -> IO ()
 runTransportServerState_ ss started port = runTransportServerSocketState ss started (startTCPServer started Nothing port) (transportName (TProxy :: TProxy c 'TServer))
-
--- | Run a transport server with provided connection setup and handler.
-runTransportServerSocket :: Transport c => TMVar Bool -> IO Socket -> String -> T.ServerParams -> TransportServerConfig -> (c 'TServer -> IO ()) -> IO ()
-runTransportServerSocket started getSocket threadLabel srvParams cfg server = do
-  ss <- newSocketState
-  runTransportServerSocketState_ ss started getSocket threadLabel (tlsSetupTimeout cfg) setupTLS (\_ -> server . snd)
-  where
-    tCfg = serverTransportConfig cfg
-    setupTLS conn = do
-      tls <- connectTLS Nothing tCfg srvParams conn
-      (False,) <$> getTransportConnection tCfg True (X.CertificateChain []) tls
 
 connectTLSServerBackend :: TransportServerConfig -> T.ServerParams -> T.Backend -> IO (TLS 'TServer)
 connectTLSServerBackend cfg srvParams backend =

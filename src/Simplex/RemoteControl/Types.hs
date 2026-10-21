@@ -17,7 +17,6 @@ module Simplex.RemoteControl.Types
     RCCtrlHello (..),
     RCHostPairing (..),
     KnownHostPairing (..),
-    RCCtrlAddress (..),
     RCCtrlPairing (..),
     RCHostKeys (..),
     RCHostSession (..),
@@ -36,7 +35,6 @@ import qualified Data.Aeson as J
 import qualified Data.Aeson.TH as JQ
 import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.ByteString (ByteString)
-import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word16)
@@ -48,7 +46,6 @@ import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (defaultJSON, dropPrefix, sumTypeJSON)
 import Simplex.Messaging.Transport (TLS, TSbChainKeys, TransportPeer (..))
-import Simplex.Messaging.Transport.Client (TransportHost)
 import Simplex.Messaging.Util (AnyError (..), safeDecodeUtf8)
 import Simplex.Messaging.Version (VersionRange, VersionScope, mkVersionRange)
 import Simplex.Messaging.Version.Internal
@@ -57,8 +54,6 @@ import UnliftIO
 data RCErrorType
   = RCEInternal {internalErr :: String}
   | RCEIdentity
-  | RCENoLocalAddress
-  | RCETLSStartFailed
   | RCEException {exception :: String}
   | RCECtrlAuth
   | RCECtrlError {ctrlErr :: String}
@@ -80,8 +75,6 @@ instance StrEncoding RCErrorType where
   strEncode = \case
     RCEInternal err -> "INTERNAL" <> text err
     RCEIdentity -> "IDENTITY"
-    RCENoLocalAddress -> "NO_LOCAL_ADDR"
-    RCETLSStartFailed -> "CTRL_TLS_START"
     RCEException err -> "EXCEPTION" <> text err
     RCECtrlAuth -> "CTRL_AUTH"
     RCECtrlError err -> "CTRL_ERROR" <> text err
@@ -97,8 +90,6 @@ instance StrEncoding RCErrorType where
     A.takeTill (== ' ') >>= \case
       "INTERNAL" -> RCEInternal <$> textP
       "IDENTITY" -> pure RCEIdentity
-      "NO_LOCAL_ADDR" -> pure RCENoLocalAddress
-      "CTRL_TLS_START" -> pure RCETLSStartFailed
       "EXCEPTION" -> RCEException <$> textP
       "CTRL_AUTH" -> pure RCECtrlAuth
       "CTRL_ERROR" -> RCECtrlError <$> textP
@@ -159,12 +150,6 @@ data RCHostPairing = RCHostPairing
 data KnownHostPairing = KnownHostPairing
   { hostFingerprint :: C.KeyHash -- this is only changed in the first session, long-term identity of connected remote host
   }
-
-data RCCtrlAddress = RCCtrlAddress
-  { address :: TransportHost, -- allows any interface when found exactly
-    interface :: Text
-  }
-  deriving (Show, Eq)
 
 -- | Long-term part of host (mobile) connection to controller (desktop)
 data RCCtrlPairing = RCCtrlPairing
@@ -245,5 +230,3 @@ type SessionCode = ByteString
 type RCStepTMVar a = TMVar (Either RCErrorType a)
 
 $(JQ.deriveJSON (sumTypeJSON $ dropPrefix "RCE") ''RCErrorType)
-
-$(JQ.deriveJSON defaultJSON ''RCCtrlAddress)
