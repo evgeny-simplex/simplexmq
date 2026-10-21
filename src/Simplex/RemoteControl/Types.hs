@@ -54,6 +54,7 @@ import UnliftIO
 data RCErrorType
   = RCEInternal {internalErr :: String}
   | RCEIdentity
+  | RCERejected
   | RCEException {exception :: String}
   | RCECtrlAuth
   | RCECtrlError {ctrlErr :: String}
@@ -75,6 +76,7 @@ instance StrEncoding RCErrorType where
   strEncode = \case
     RCEInternal err -> "INTERNAL" <> text err
     RCEIdentity -> "IDENTITY"
+    RCERejected -> "REJECTED"
     RCEException err -> "EXCEPTION" <> text err
     RCECtrlAuth -> "CTRL_AUTH"
     RCECtrlError err -> "CTRL_ERROR" <> text err
@@ -90,6 +92,7 @@ instance StrEncoding RCErrorType where
     A.takeTill (== ' ') >>= \case
       "INTERNAL" -> RCEInternal <$> textP
       "IDENTITY" -> pure RCEIdentity
+      "REJECTED" -> pure RCERejected
       "EXCEPTION" -> RCEException <$> textP
       "CTRL_AUTH" -> pure RCECtrlAuth
       "CTRL_ERROR" -> RCECtrlError <$> textP

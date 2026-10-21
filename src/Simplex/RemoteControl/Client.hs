@@ -180,7 +180,7 @@ certFingerprint caCert = C.KeyHash fp
 
 cancelHostClient :: RCHostClient -> IO ()
 cancelHostClient RCHostClient {action, client_ = RCHClient_ {endSession}} = do
-  atomically $ putTMVar endSession ()
+  void . atomically $ tryPutTMVar endSession ()
   uninterruptibleCancel action
 
 prepareHostSession :: TVar ChaChaDRG -> C.KeyHash -> RCHostPairing -> RCHostKeys -> RCHostEncHello -> ExceptT RCErrorType IO (RCCtrlEncHello, HostSessKeys, RCHostHello, RCHostPairing)
@@ -267,10 +267,7 @@ connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca} 
           logDebug "Waiting for session confirmation"
           atomically (readTMVar confirmSession) >>= \case
             True -> runSession tls r' `putRCError` r'
-            False -> do
-              -- release second putTMVar in confirmCtrlSession
-              void . atomically $ takeTMVar confirmSession
-              throwE (RCEInternal "session rejected") `putRCError` r'
+            False -> throwE RCERejected `putRCError` r'
       where
         connectBackend cfg = bracketOnError getBackend TLS.backendClose $ connectTLSClientBackend cfg ca
         runSession tls r' = do
@@ -281,8 +278,6 @@ connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca} 
           ctrlSessKeys <- prepareCtrlSession pairing' inv sharedKey dhPrivKey kemPrivKey ctrlEncHello
           whenM (atomically $ tryPutTMVar r' $ Right (RCCtrlSession {tls, sessionKeys = ctrlSessKeys}, pairing')) $ do
             logDebug "Session started"
-            -- release second putTMVar in confirmCtrlSession
-            void . atomically $ takeTMVar confirmSession
             atomically $ takeTMVar endSession
             logDebug "Session ended"
 
@@ -347,14 +342,11 @@ prepareCtrlSession
 -- application should call this function when TMVar resolves
 confirmCtrlSession :: RCCtrlClient -> Bool -> IO ()
 confirmCtrlSession RCCtrlClient {client_ = RCCClient_ {confirmSession}} res = do
-  atomically $ putTMVar confirmSession res
-  -- controler does takeTMVar, freeing the slot
-  -- TODO add timeout
-  atomically $ putTMVar confirmSession res -- wait for Ctrl to take the var
+  void . atomically $ tryPutTMVar confirmSession res
 
 cancelCtrlClient :: RCCtrlClient -> IO ()
 cancelCtrlClient RCCtrlClient {action, client_ = RCCClient_ {endSession}} = do
-  atomically $ putTMVar endSession ()
+  void . atomically $ tryPutTMVar endSession ()
   uninterruptibleCancel action
 
 -- * Session encryption

@@ -53,6 +53,9 @@ remoteControlTests = do
     it "should fail when known host CA differs" testKnownHostMismatch
     it "should report backend failure on both sides" testBackendFailure
     it "should end session when session code is rejected" testRejectSession
+    it "should return from repeated confirmation" testConfirmTwice
+    it "should return from confirmation after cancel" testConfirmAfterCancel
+    it "should return from confirmation after handshake failure" testConfirmAfterFailure
     it "should cancel host session waiting for backend" testCancelWaitingBackend
     it "should cancel controller session waiting for backend" testCancelCtrlWaitingBackend
 
@@ -245,7 +248,7 @@ testKnownHostMismatch = do
   -- the host finishes its handshake before the controller checks the host certificate
   takeStep r' >>= \case
     Left _ -> pure ()
-    Right (_, tls, _) -> tryAny (cGet tls 1) >>= either (\_ -> pure ()) (`shouldBe` "")
+    Right (_, tls, _) -> timeout 5000000 (tryAny (cGet tls 1)) >>= maybe (expectationFailure "host read did not end") (either (\_ -> pure ()) (`shouldBe` ""))
   backendSend ctrlBackend "x" `shouldThrow` anyIOException
   backendSend hostBackend "x" `shouldThrow` anyIOException
   RC.cancelCtrlClient cc
@@ -283,9 +286,11 @@ testCancelWaitingBackend = do
     Left err -> fromException err `shouldBe` Just AsyncCancelled
     Right () -> expectationFailure "session ended without cancellation"
   atomically (isEmptyTMVar r) `shouldReturn` True
-  (b, _) <- pipeBackends
+  (b, b') <- pipeBackends
   atomically $ putTMVar backend b
   atomically (isEmptyTMVar backend) `shouldReturn` False
+  backendClose b
+  backendClose b'
 
 testCancelCtrlWaitingBackend :: IO ()
 testCancelCtrlWaitingBackend = do
@@ -301,9 +306,11 @@ testCancelCtrlWaitingBackend = do
     Left err -> fromException err `shouldBe` Just AsyncCancelled
     Right () -> expectationFailure "session ended without cancellation"
   atomically (isEmptyTMVar r) `shouldReturn` True
-  (b, _) <- pipeBackends
+  (b, b') <- pipeBackends
   atomically $ putTMVar backend b
   atomically (isEmptyTMVar backend) `shouldReturn` False
+  backendClose b
+  backendClose b'
 
 testRejectSession :: IO ()
 testRejectSession = do
@@ -318,7 +325,7 @@ testRejectSession = do
     Right (_, _, r'') -> do
       timeout 5000000 (RC.confirmCtrlSession cc False) `shouldReturn` Just ()
       takeStep r'' >>= \case
-        Left e -> e `shouldBe` RCEInternal "session rejected"
+        Left e -> e `shouldBe` RCERejected
         Right _ -> expectationFailure "session started after rejection"
   timeout 5000000 (waitCatch (CC.action cc)) >>= \case
     Just (Right ()) -> pure ()
@@ -326,6 +333,44 @@ testRejectSession = do
   takeStep r >>= \case
     Left e -> expectationFailure $ "unexpected error: " <> show e
     Right _ -> pure ()
+  RC.cancelHostClient hc
+
+-- starts both sides and returns once the controller (mobile) side has its TLS session
+startPair :: IO (RC.RCHostClient, RC.RCCtrlClient, RCStepTMVar (RCCtrlSession, RCCtrlPairing), Backend, Backend)
+startPair = do
+  drg <- C.newRandom
+  hp <- RC.newRCHostPairing drg
+  (ctrlBackend, hostBackend) <- pipeBackends
+  (signedInv, hc, _) <- runRight $ RC.connectRCHost drg hp (J.String "app") (pure ctrlBackend)
+  inv <- maybe (fail "bad invite") pure $ verifySignedInvitation signedInv
+  (cc, r') <- runRight $ RC.connectRCCtrl drg inv Nothing (J.String "app") (pure hostBackend)
+  takeStep r' >>= \case
+    Left e -> fail $ "unexpected error: " <> show e
+    Right (_, _, r'') -> pure (hc, cc, r'', ctrlBackend, hostBackend)
+
+testConfirmTwice :: IO ()
+testConfirmTwice = do
+  (hc, cc, _, _, _) <- startPair
+  timeout 5000000 (RC.confirmCtrlSession cc False >> RC.confirmCtrlSession cc False) `shouldReturn` Just ()
+  timeout 5000000 (RC.confirmCtrlSession cc True) `shouldReturn` Just ()
+  RC.cancelHostClient hc
+
+testConfirmAfterCancel :: IO ()
+testConfirmAfterCancel = do
+  (hc, cc, _, _, _) <- startPair
+  timeout 5000000 (RC.cancelCtrlClient cc) `shouldReturn` Just ()
+  timeout 5000000 (RC.confirmCtrlSession cc True >> RC.confirmCtrlSession cc False) `shouldReturn` Just ()
+  RC.cancelHostClient hc
+
+testConfirmAfterFailure :: IO ()
+testConfirmAfterFailure = do
+  (hc, cc, r'', ctrlBackend, _) <- startPair
+  backendClose ctrlBackend
+  timeout 5000000 (RC.confirmCtrlSession cc True) `shouldReturn` Just ()
+  takeStep r'' >>= \case
+    Left _ -> pure ()
+    Right _ -> expectationFailure "session started over a closed backend"
+  timeout 5000000 (RC.confirmCtrlSession cc True) `shouldReturn` Just ()
   RC.cancelHostClient hc
 
 takeStep :: TMVar a -> IO a
