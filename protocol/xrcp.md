@@ -111,7 +111,7 @@ Once TLS session is established, both the host and controller devices present a 
 
 To verify the session, the user matches the codes (e.g., visually or via QR code scan) and confirms the session on the host device.
 
-The host application answers the confirmation once, without blocking the session task. The first answer is used and later answers are ignored. If the host rejects the session, it closes the connection with the REJECTED error and does not send HELLO.
+If the user rejects the session, the host closes the TLS connection without sending HELLO. No rejection message is sent; the controller sees the connection end.
 
 The user MUST verify the first session with a new controller. The host stores the long-term identity of the controller (CA fingerprint and Ed25519 public key) only after this session is verified. A controller with the stored long-term identity is a known controller.
 
