@@ -58,12 +58,9 @@ data RCErrorType
   = RCEInternal {internalErr :: String}
   | RCEIdentity
   | RCENoLocalAddress
-  | RCENewController
-  | RCENotDiscovered
   | RCETLSStartFailed
   | RCEException {exception :: String}
   | RCECtrlAuth
-  | RCECtrlNotFound
   | RCECtrlError {ctrlErr :: String}
   | RCEInvitation
   | RCEVersion
@@ -84,12 +81,9 @@ instance StrEncoding RCErrorType where
     RCEInternal err -> "INTERNAL" <> text err
     RCEIdentity -> "IDENTITY"
     RCENoLocalAddress -> "NO_LOCAL_ADDR"
-    RCENewController -> "NEW_CONTROLLER"
-    RCENotDiscovered -> "NOT_DISCOVERED"
     RCETLSStartFailed -> "CTRL_TLS_START"
     RCEException err -> "EXCEPTION" <> text err
     RCECtrlAuth -> "CTRL_AUTH"
-    RCECtrlNotFound -> "CTRL_NOT_FOUND"
     RCECtrlError err -> "CTRL_ERROR" <> text err
     RCEInvitation -> "INVITATION"
     RCEVersion -> "VERSION"
@@ -104,12 +98,9 @@ instance StrEncoding RCErrorType where
       "INTERNAL" -> RCEInternal <$> textP
       "IDENTITY" -> pure RCEIdentity
       "NO_LOCAL_ADDR" -> pure RCENoLocalAddress
-      "NEW_CONTROLLER" -> pure RCENewController
-      "NOT_DISCOVERED" -> pure RCENotDiscovered
       "CTRL_TLS_START" -> pure RCETLSStartFailed
       "EXCEPTION" -> RCEException <$> textP
       "CTRL_AUTH" -> pure RCECtrlAuth
-      "CTRL_NOT_FOUND" -> pure RCECtrlNotFound
       "CTRL_ERROR" -> RCECtrlError <$> textP
       "INVITATION" -> pure RCEInvitation
       "VERSION" -> pure RCEVersion
@@ -166,8 +157,7 @@ data RCHostPairing = RCHostPairing
   }
 
 data KnownHostPairing = KnownHostPairing
-  { hostFingerprint :: C.KeyHash, -- this is only changed in the first session, long-term identity of connected remote host
-    hostDhPubKey :: C.PublicKeyX25519
+  { hostFingerprint :: C.KeyHash -- this is only changed in the first session, long-term identity of connected remote host
   }
 
 data RCCtrlAddress = RCCtrlAddress
@@ -182,8 +172,7 @@ data RCCtrlPairing = RCCtrlPairing
     caCert :: X.SignedCertificate,
     ctrlFingerprint :: C.KeyHash, -- long-term identity of connected remote controller
     idPubKey :: C.PublicKeyEd25519,
-    dhPrivKey :: C.PrivateKeyX25519,
-    prevDhPrivKey :: Maybe C.PrivateKeyX25519
+    dhPrivKey :: C.PrivateKeyX25519
   }
 
 data RCHostKeys = RCHostKeys

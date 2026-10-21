@@ -9,15 +9,12 @@ module RemoteControl where
 
 import AgentTests.FunctionalAPITests (runRight)
 import Control.Logger.Simple
-import Control.Monad (void)
-import Control.Monad.Trans.Except (runExceptT)
 import Crypto.Random (ChaChaDRG)
 import qualified Data.Aeson as J
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import Data.List (stripPrefix)
-import Data.List.NonEmpty (NonEmpty (..))
-import Data.Time.Clock.System (SystemTime (..), getSystemTime)
+import Data.Time.Clock.System (SystemTime (..))
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
 import Simplex.Messaging.Transport (TSbChainKeys (..))
@@ -26,10 +23,9 @@ import qualified Simplex.RemoteControl.Client as HC (RCHostClient (action))
 import qualified Simplex.RemoteControl.Client as RC
 import Simplex.RemoteControl.Discovery (mkLastLocalHost, preferAddress)
 import Simplex.RemoteControl.Invitation
-  ( RCEncInvitation (..),
-    RCInvitation (..),
+  ( RCInvitation (..),
     RCSignedInvitation,
-    signInvitation,
+    invitationTsValid,
     verifySignedInvitation,
   )
 import Simplex.RemoteControl.Types
@@ -44,12 +40,10 @@ remoteControlTests = do
   describe "Invitation parsing" $ do
     it "should parse bracketed IPv6 host with port" testInvitationBracketedIPv6Host
     it "should reject bracketed non-IPv6 host" testInvitationBracketedNonIPv6HostRejected
+    it "should accept invitation only within timestamp window" testInvitationTimestamp
   describe "New controller/host pairing" $ do
     it "should connect to new pairing" testNewPairing
     it "should connect to existing pairing" testExistingPairing
-  describe "Multicast discovery" $ do
-    it "should find paired host and connect" testMulticast
-    it "should accept announcement only within timestamp window" testAnnouncementTimestamp
 
 testPreferAddress :: Spec
 testPreferAddress = do
@@ -141,7 +135,7 @@ testNewPairing = do
   invVar <- newEmptyMVar
   ctrlSessId <- async . runRight $ do
     logNote "c 1"
-    (_found, inv, hc, r) <- RC.connectRCHost drg hp (J.String "app") False Nothing Nothing
+    (_found, inv, hc, r) <- RC.connectRCHost drg hp (J.String "app") Nothing Nothing
     logNote "c 2"
     putMVar invVar (inv, hc)
     logNote "c 3"
@@ -203,75 +197,42 @@ testExistingPairing = do
   drg <- C.newRandom
   invVar <- newEmptyMVar
   hp <- RC.newRCHostPairing drg
-  ctrl <- runCtrl drg False hp invVar
+  ctrl <- runCtrl drg hp invVar
   inv <- takeMVar invVar
   let cp_ = Nothing
   host <- runHostURI drg cp_ inv
   timeout 5000000 (waitBoth ctrl host) >>= \case
     Nothing -> fail "timeout"
     Just (hp', cp') -> do
-      ctrl' <- runCtrl drg False hp' invVar
+      ctrl' <- runCtrl drg hp' invVar
       inv' <- takeMVar invVar
       host' <- runHostURI drg (Just cp') inv'
       timeout 5000000 (waitBoth ctrl' host') >>= \case
         Nothing -> fail "timeout"
         Just (_hp2, cp2) -> do
-          ctrl2 <- runCtrl drg False hp' invVar -- old host pairing used to test controller not updating state
+          ctrl2 <- runCtrl drg hp' invVar -- old host pairing used to test controller not updating state
           inv2 <- takeMVar invVar
           host2 <- runHostURI drg (Just cp2) inv2
           timeout 5000000 (waitBoth ctrl2 host2) >>= \case
             Nothing -> fail "timeout"
             Just (hp3, cp3) -> do
-              ctrl3 <- runCtrl drg False hp3 invVar
+              ctrl3 <- runCtrl drg hp3 invVar
               inv3 <- takeMVar invVar
               host3 <- runHostURI drg (Just cp3) inv3
               timeout 5000000 (waitBoth ctrl3 host3) >>= \case
                 Nothing -> fail "timeout"
                 Just _ -> pure ()
 
-testMulticast :: IO ()
-testMulticast = do
-  drg <- C.newRandom
-  subscribers <- newTMVarIO 0
-  invVar <- newEmptyMVar
-  hp <- RC.newRCHostPairing drg
-  ctrl <- runCtrl drg False hp invVar
-  inv <- takeMVar invVar
-  let cp_ = Nothing
-  host <- runHostURI drg cp_ inv
-  timeout 5000000 (waitBoth ctrl host) >>= \case
-    Nothing -> fail "timeout"
-    Just (hp', cp') -> do
-      ctrl' <- runCtrl drg True hp' invVar
-      _inv <- takeMVar invVar
-      host' <- runHostMulticast drg subscribers cp'
-      timeout 5000000 (waitBoth ctrl' host') >>= \case
-        Nothing -> fail "timeout"
-        Just _ -> pure ()
+testInvitationTimestamp :: IO ()
+testInvitationTimestamp = do
+  inv <- testIPv6Invitation
+  let validAt offset = invitationTsValid (MkSystemTime 0 0) inv {ts = MkSystemTime offset 0}
+  map validAt [0, -3600, -3660, 3500, 3600] `shouldBe` replicate 5 True
+  map validAt [-3661, -3700, 3601, 3700] `shouldBe` replicate 4 False
 
-testAnnouncementTimestamp :: IO ()
-testAnnouncementTimestamp = do
-  drg <- C.newRandom
-  RCHostPairing {caKey, caCert, idPrivKey} <- RC.newRCHostPairing drg
-  (hostDhPubKey, dhPrivKey) <- atomically $ C.generateKeyPair @'C.X25519 drg
-  (skey, sessPrivKey) <- atomically $ C.generateKeyPair @'C.Ed25519 drg
-  (dh, ctrlDhPrivKey) <- atomically $ C.generateKeyPair @'C.X25519 drg
-  nonce <- atomically $ C.randomCbNonce drg
-  now <- systemSeconds <$> getSystemTime
-  let pairing = RCCtrlPairing {caKey, caCert, ctrlFingerprint = C.KeyHash "test-ca", idPubKey = C.publicKey idPrivKey, dhPrivKey, prevDhPrivKey = Nothing}
-      announce offset = do
-        let inv = RCInvitation {ca = C.KeyHash "test-ca", host = "127.0.0.1", port = 5223, v = supportedRCPVRange, app = J.String "app", ts = MkSystemTime (now + offset) 0, skey, idkey = C.publicKey idPrivKey, dh}
-        encInvitation <- either (fail . show) pure $ C.cbEncrypt (C.dh' hostDhPubKey ctrlDhPrivKey) nonce (strEncode $ signInvitation sessPrivKey idPrivKey inv) 900
-        runExceptT . void $ RC.findRCCtrlPairing (pairing :| []) RCEncInvitation {dhPubKey = dh, nonce, encInvitation}
-  announce 0 `shouldReturn` Right ()
-  announce (-3600) `shouldReturn` Right ()
-  announce 3500 `shouldReturn` Right ()
-  announce (-3700) `shouldReturn` Left RCEInvitation
-  announce 3700 `shouldReturn` Left RCEInvitation
-
-runCtrl :: TVar ChaChaDRG -> Bool -> RCHostPairing -> MVar RCSignedInvitation -> IO (Async RCHostPairing)
-runCtrl drg multicast hp invVar = async . runRight $ do
-  (_found, inv, hc, r) <- RC.connectRCHost drg hp (J.String "app") multicast Nothing Nothing
+runCtrl :: TVar ChaChaDRG -> RCHostPairing -> MVar RCSignedInvitation -> IO (Async RCHostPairing)
+runCtrl drg hp invVar = async . runRight $ do
+  (_found, inv, hc, r) <- RC.connectRCHost drg hp (J.String "app") Nothing Nothing
   putMVar invVar inv
   Right (_sessId, _tls, r') <- atomically $ takeTMVar r
   Right (_rcHostSession, _rcHelloBody, hp') <- atomically $ takeTMVar r'
@@ -283,16 +244,6 @@ runHostURI :: TVar ChaChaDRG -> Maybe RCCtrlPairing -> RCSignedInvitation -> IO 
 runHostURI drg cp_ signedInv = async . runRight $ do
   inv <- maybe (fail "bad invite") pure $ verifySignedInvitation signedInv
   (rcCtrlClient, r) <- RC.connectRCCtrl drg inv cp_ (J.String "app")
-  Right (_sessId', _tls, r') <- atomically $ takeTMVar r
-  liftIO $ RC.confirmCtrlSession rcCtrlClient True
-  Right (_rcCtrlSession, cp') <- atomically $ takeTMVar r'
-  threadDelay 250000
-  pure cp'
-
-runHostMulticast :: TVar ChaChaDRG -> TMVar Int -> RCCtrlPairing -> IO (Async RCCtrlPairing)
-runHostMulticast drg subscribers cp = async . runRight $ do
-  (pairing, inv) <- RC.discoverRCCtrl subscribers (cp :| [])
-  (rcCtrlClient, r) <- RC.connectRCCtrl drg inv (Just pairing) (J.String "app")
   Right (_sessId', _tls, r') <- atomically $ takeTMVar r
   liftIO $ RC.confirmCtrlSession rcCtrlClient True
   Right (_rcCtrlSession, cp') <- atomically $ takeTMVar r'

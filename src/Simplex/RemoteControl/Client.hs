@@ -16,7 +16,6 @@ module Simplex.RemoteControl.Client
     RCCtrlClient (action),
     RCCtrlConnection,
     connectRCCtrl,
-    discoverRCCtrl,
     confirmCtrlSession,
     cancelCtrlClient,
     RCStepTMVar,
@@ -26,10 +25,8 @@ module Simplex.RemoteControl.Client
     -- for tests only
     sendRCPacket,
     receiveRCPacket,
-    findRCCtrlPairing,
   ) where
 
-import Control.Applicative ((<|>))
 import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Except
@@ -38,7 +35,6 @@ import Control.Monad.Trans.Except
 import Crypto.Random (ChaChaDRG)
 import qualified Data.Aeson as J
 import Data.Bitraversable (bimapM)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as LB
 import Data.Default (def)
@@ -47,14 +43,13 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as L
 import Data.Maybe (isNothing)
 import qualified Data.Text as T
-import Data.Time.Clock.System (SystemTime (..), getSystemTime)
+import Data.Time.Clock.System (getSystemTime)
 import Data.Tuple (swap)
 import Data.Word (Word16)
 import qualified Data.X509 as X
 import Data.X509.Validation (Fingerprint (..), getFingerprint)
-import Network.Socket (PortNumber, SockAddr (..), hostAddressToTuple)
+import Network.Socket (PortNumber)
 import qualified Network.TLS as TLS
-import qualified Network.UDP as UDP
 import Simplex.Messaging.Agent.Client ()
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.Lazy (LazyByteString)
@@ -62,27 +57,22 @@ import qualified Simplex.Messaging.Crypto.Lazy as LC
 import Simplex.Messaging.Crypto.SNTRUP761
 import Simplex.Messaging.Crypto.SNTRUP761.Bindings
 import Simplex.Messaging.Encoding
-import Simplex.Messaging.Encoding.String (StrEncoding (..))
 import Simplex.Messaging.Transport (TSbChainKeys (..), TLS (..), TransportPeer (..), cGet, cPut)
 import Simplex.Messaging.Transport.Buffer (peekBuffered)
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTransportClient)
 import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
 import Simplex.Messaging.Util
 import Simplex.Messaging.Version
-import Simplex.RemoteControl.Discovery (getLocalAddress, recvAnnounce, startTLSServer, withListener, withSender)
+import Simplex.RemoteControl.Discovery (getLocalAddress, startTLSServer)
 import Simplex.RemoteControl.Invitation
 import Simplex.RemoteControl.Types
 import UnliftIO
-import UnliftIO.Concurrent
 
 xrcpBlockSize :: Int
 xrcpBlockSize = 16384
 
 helloBlockSize :: Int
 helloBlockSize = 12288
-
-encInvitationSize :: Int
-encInvitationSize = 900
 
 newRCHostPairing :: TVar ChaChaDRG -> IO RCHostPairing
 newRCHostPairing drg = do
@@ -97,28 +87,22 @@ data RCHostClient = RCHostClient
 
 data RCHClient_ = RCHClient_
   { startedPort :: TMVar (Maybe PortNumber),
-    announcer :: TMVar (Async (Either RCErrorType ())),
     hostCAHash :: TMVar C.KeyHash,
     endSession :: TMVar ()
   }
 
 type RCHostConnection = (NonEmpty RCCtrlAddress, RCSignedInvitation, RCHostClient, RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)))
 
-connectRCHost :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> Bool -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
-connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo multicast rcAddrPrefs_ port_ = do
+connectRCHost :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
+connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo rcAddrPrefs_ port_ = do
   r <- newEmptyTMVarIO
   found@(RCCtrlAddress {address} :| _) <- findCtrlAddress
-  c@RCHClient_ {startedPort, announcer} <- liftIO mkClient
+  c@RCHClient_ {startedPort} <- liftIO mkClient
   hostKeys <- atomically genHostKeys
   action <- liftIO $ runClient c r hostKeys
   -- wait for the port to make invitation
   portNum <- atomically $ readTMVar startedPort
-  signedInv@RCSignedInvitation {invitation} <- maybe (throwE RCETLSStartFailed) (liftIO . mkInvitation hostKeys address) portNum
-  when multicast $ case knownHost of
-    Nothing -> throwE RCENewController
-    Just KnownHostPairing {hostDhPubKey} -> do
-      ann <- liftIO . async . runExceptT $ announceRC drg 60 idPrivKey hostDhPubKey hostKeys invitation
-      atomically $ putTMVar announcer ann
+  signedInv <- maybe (throwE RCETLSStartFailed) (liftIO . mkInvitation hostKeys address) portNum
   pure (found, signedInv, RCHostClient {action, client_ = c}, r)
   where
     findCtrlAddress :: ExceptT RCErrorType IO (NonEmpty RCCtrlAddress)
@@ -128,12 +112,11 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
     mkClient :: IO RCHClient_
     mkClient = do
       startedPort <- newEmptyTMVarIO
-      announcer <- newEmptyTMVarIO
       endSession <- newEmptyTMVarIO
       hostCAHash <- newEmptyTMVarIO
-      pure RCHClient_ {startedPort, announcer, hostCAHash, endSession}
+      pure RCHClient_ {startedPort, hostCAHash, endSession}
     runClient :: RCHClient_ -> RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)) -> RCHostKeys -> IO (Async ())
-    runClient RCHClient_ {startedPort, announcer, hostCAHash, endSession} r hostKeys = do
+    runClient RCHClient_ {startedPort, hostCAHash, endSession} r hostKeys = do
       tlsCreds <- genTLSCredentials drg caKey caCert
       startTLSServer port_ startedPort tlsCreds (tlsHooks r knownHost hostCAHash) $ \tls ->
         void . runExceptT $ do
@@ -150,7 +133,6 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
           sendRCPacket tls ctrlEncHello
           logDebug "Sent ctrl HELLO"
           whenM (atomically $ tryPutTMVar r' $ Right (RCHostSession {tls, sessionKeys}, helloBody, pairing')) $ do
-            atomically (tryReadTMVar announcer) >>= mapM_ uninterruptibleCancel
             -- can use `RCHostSession` until `endSession` is signalled
             logDebug "Holding session"
             atomically $ takeTMVar endSession
@@ -203,9 +185,8 @@ certFingerprint caCert = C.KeyHash fp
     Fingerprint fp = getFingerprint caCert X.HashSHA256
 
 cancelHostClient :: RCHostClient -> IO ()
-cancelHostClient RCHostClient {action, client_ = RCHClient_ {announcer, endSession}} = do
+cancelHostClient RCHostClient {action, client_ = RCHClient_ {endSession}} = do
   atomically $ putTMVar endSession ()
-  atomically (tryTakeTMVar announcer) >>= mapM_ uninterruptibleCancel
   uninterruptibleCancel action
 
 prepareHostSession :: TVar ChaChaDRG -> C.KeyHash -> RCHostPairing -> RCHostKeys -> RCHostEncHello -> ExceptT RCErrorType IO (RCCtrlEncHello, HostSessKeys, RCHostHello, RCHostPairing)
@@ -224,7 +205,7 @@ prepareHostSession
     unless (isCompatible v supportedRCPVRange) $ throwE RCEVersion
     (sndKey, rcvKey) <- bimapM newTVarIO newTVarIO $ C.sbcInit "" hybridKey
     let keys = HostSessKeys {chainKeys = TSbChainKeys {sndKey, rcvKey}, idPrivKey, sessPrivKey}
-    knownHost' <- updateKnownHost ca dhPubKey
+    knownHost' <- updateKnownHost ca
     let ctrlHello = RCCtrlHello {}
     -- TODO send error response if something fails
     (sk, nonce') <- atomically $ stateTVar sndKey C.sbcHkdf
@@ -232,13 +213,13 @@ prepareHostSession
     let ctrlEncHello = RCCtrlEncHello {kem = kemCiphertext, encBody = encBody'}
     pure (ctrlEncHello, keys, hostHello, pairing {knownHost = Just knownHost'})
     where
-      updateKnownHost :: C.KeyHash -> C.PublicKeyX25519 -> ExceptT RCErrorType IO KnownHostPairing
-      updateKnownHost ca hostDhPubKey = case knownHost_ of
+      updateKnownHost :: C.KeyHash -> ExceptT RCErrorType IO KnownHostPairing
+      updateKnownHost ca = case knownHost_ of
         Just h -> do
           unless (hostFingerprint h == tlsHostFingerprint) . throwE $
             RCEInternal "TLS host CA is different from host pairing, should be caught in TLS handshake"
-          pure (h :: KnownHostPairing) {hostDhPubKey}
-        Nothing -> pure KnownHostPairing {hostFingerprint = ca, hostDhPubKey}
+          pure h
+        Nothing -> pure KnownHostPairing {hostFingerprint = ca}
 
 data RCCtrlClient = RCCtrlClient
   { action :: Async (),
@@ -262,12 +243,12 @@ connectRCCtrl drg (RCVerifiedInvitation inv@RCInvitation {ca, idkey}) pairing_ h
     newCtrlPairing = do
       ((_, caKey), caCert) <- genCredentials drg Nothing (1, 24 * 999999) "ca"
       (_, dhPrivKey) <- atomically $ C.generateKeyPair drg
-      pure RCCtrlPairing {caKey, caCert, ctrlFingerprint = ca, idPubKey = idkey, dhPrivKey, prevDhPrivKey = Nothing}
+      pure RCCtrlPairing {caKey, caCert, ctrlFingerprint = ca, idPubKey = idkey, dhPrivKey}
     updateCtrlPairing :: RCCtrlPairing -> ExceptT RCErrorType IO RCCtrlPairing
-    updateCtrlPairing pairing@RCCtrlPairing {ctrlFingerprint, idPubKey, dhPrivKey = currDhPrivKey} = do
+    updateCtrlPairing pairing@RCCtrlPairing {ctrlFingerprint, idPubKey} = do
       unless (ca == ctrlFingerprint && idPubKey == idkey) $ throwE RCEIdentity
       (_, dhPrivKey) <- atomically $ C.generateKeyPair drg
-      pure pairing {dhPrivKey, prevDhPrivKey = Just currDhPrivKey}
+      pure pairing {dhPrivKey}
 
 connectRCCtrl_ :: TVar ChaChaDRG -> RCCtrlPairing -> RCInvitation -> J.Value -> ExceptT RCErrorType IO RCCtrlConnection
 connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca, host, port} hostAppInfo = do
@@ -360,57 +341,6 @@ prepareCtrlSession
     RCCtrlEncError {nonce, encMessage} -> do
       message <- liftEitherWith (const RCEDecrypt) $ C.cbDecrypt sharedKey nonce encMessage
       throwE $ RCECtrlError $ T.unpack $ safeDecodeUtf8 message
-
--- * Multicast discovery
-
-announceRC :: TVar ChaChaDRG -> Int -> C.PrivateKeyEd25519 -> C.PublicKeyX25519 -> RCHostKeys -> RCInvitation -> ExceptT RCErrorType IO ()
-announceRC drg maxCount idPrivKey knownDhPub RCHostKeys {sessKeys, dhKeys} inv = ExceptT $ withSender $ \sender -> runExceptT $ do
-  replicateM_ maxCount $ do
-    logDebug "Announcing..."
-    nonce <- atomically $ C.randomCbNonce drg
-    encInvitation <- liftEitherWith (const RCEEncrypt) $ C.cbEncrypt sharedKey nonce sigInvitation encInvitationSize
-    liftIO . UDP.send sender $ smpEncode RCEncInvitation {dhPubKey, nonce, encInvitation}
-    threadDelay 1000000
-  where
-    sigInvitation = strEncode $ signInvitation sPrivKey idPrivKey inv
-    (_sPub, sPrivKey) = sessKeys
-    sharedKey = C.dh' knownDhPub dhPrivKey
-    (dhPubKey, dhPrivKey) = dhKeys
-
-discoverRCCtrl :: TMVar Int -> NonEmpty RCCtrlPairing -> ExceptT RCErrorType IO (RCCtrlPairing, RCVerifiedInvitation)
-discoverRCCtrl subscribers pairings =
-  timeoutThrow RCENotDiscovered 30000000 $ ExceptT $ withListener subscribers $ \listener ->
-    runExceptT . loop $ do
-      (source, bytes) <- liftIO $ recvAnnounce listener
-      encInvitation <- liftEitherWith (const RCEInvitation) $ smpDecode bytes
-      r@(_, RCVerifiedInvitation RCInvitation {host}) <- findRCCtrlPairing pairings encInvitation
-      case source of
-        SockAddrInet _ ha | THIPv4 (hostAddressToTuple ha) == host -> pure ()
-        _ -> throwE RCEInvitation
-      pure r
-  where
-    loop :: ExceptT RCErrorType IO a -> ExceptT RCErrorType IO a
-    loop action = action `catchAllErrors` \e -> logError (tshow e) >> loop action
-
-findRCCtrlPairing :: NonEmpty RCCtrlPairing -> RCEncInvitation -> ExceptT RCErrorType IO (RCCtrlPairing, RCVerifiedInvitation)
-findRCCtrlPairing pairings RCEncInvitation {dhPubKey, nonce, encInvitation} = do
-  (pairing, signedInvStr) <- liftEither $ decrypt (L.toList pairings)
-  signedInv <- liftEitherWith RCESyntax $ strDecode signedInvStr
-  inv@(RCVerifiedInvitation RCInvitation {dh = invDh, ts}) <- maybe (throwE RCEInvitation) pure $ verifySignedInvitation signedInv
-  unless (invDh == dhPubKey) $ throwE RCEInvitation
-  now <- systemSeconds <$> liftIO getSystemTime
-  unless (now - 3660 <= systemSeconds ts && systemSeconds ts <= now + 3600) $ throwE RCEInvitation
-  pure (pairing, inv)
-  where
-    decrypt :: [RCCtrlPairing] -> Either RCErrorType (RCCtrlPairing, ByteString)
-    decrypt [] = Left RCECtrlNotFound
-    decrypt (pairing@RCCtrlPairing {dhPrivKey, prevDhPrivKey} : rest) =
-      let r = decrypt_ dhPrivKey <|> (decrypt_ =<< prevDhPrivKey)
-       in maybe (decrypt rest) (Right . (pairing,)) r
-    decrypt_ :: C.PrivateKeyX25519 -> Maybe ByteString
-    decrypt_ dhPrivKey =
-      let key = C.dh' dhPubKey dhPrivKey
-       in eitherToMaybe $ C.cbDecrypt key nonce encInvitation
 
 -- * Controller handle operations
 

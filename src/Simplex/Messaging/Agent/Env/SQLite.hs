@@ -281,8 +281,7 @@ data Env = Env
     random :: TVar ChaChaDRG,
     randomServer :: TVar StdGen,
     ntfSupervisor :: NtfSupervisor,
-    xftpAgent :: XFTPAgent,
-    multicastSubscribers :: TMVar Int
+    xftpAgent :: XFTPAgent
   }
 
 newSMPAgentEnv :: AgentConfig -> DBStore -> IO Env
@@ -291,8 +290,7 @@ newSMPAgentEnv config store = do
   randomServer <- newTVarIO =<< liftIO newStdGen
   ntfSupervisor <- newNtfSubSupervisor $ tbqSize config
   xftpAgent <- newXFTPAgent
-  multicastSubscribers <- newTMVarIO 0
-  pure Env {config, store, random, randomServer, ntfSupervisor, xftpAgent, multicastSubscribers}
+  pure Env {config, store, random, randomServer, ntfSupervisor, xftpAgent}
 
 createAgentStore :: DBOpts -> MigrationConfig -> IO (Either MigrationError DBStore)
 createAgentStore = createStore

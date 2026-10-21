@@ -13,15 +13,11 @@ module Simplex.RemoteControl.Discovery
     mkLastLocalHost,
     preferAddress,
     startTLSServer,
-    withSender,
-    withListener,
-    recvAnnounce,
   ) where
 
 import Control.Applicative ((<|>))
 import Control.Logger.Simple
 import Control.Monad
-import Data.ByteString (ByteString)
 import Data.Default (def)
 import Data.List (delete, find, partition)
 import Data.Maybe (mapMaybe)
@@ -31,25 +27,16 @@ import Data.Word (Word16)
 import Network.Info (IPv4 (..), NetworkInterface (..), getNetworkInterfaces)
 import qualified Network.Socket as N
 import qualified Network.TLS as TLS
-import qualified Network.UDP as UDP
 import Simplex.Messaging.Transport (TransportPeer (..), defaultSupportedParams)
 import qualified Simplex.Messaging.Transport as Transport
 import Simplex.Messaging.Transport.Client (TransportHost (..))
 import Simplex.Messaging.Transport.Server (mkTransportServerConfig, runTransportServerSocket, startTCPServer)
 import Simplex.Messaging.Util (ifM, tshow)
-import Simplex.RemoteControl.Discovery.Multicast (setMembership)
 import Simplex.RemoteControl.Types
 import UnliftIO
 
--- | mDNS multicast group
-pattern MULTICAST_ADDR_V4 :: (IsString a, Eq a) => a
-pattern MULTICAST_ADDR_V4 = "224.0.0.251"
-
 pattern ANY_ADDR_V4 :: (IsString a, Eq a) => a
 pattern ANY_ADDR_V4 = "0.0.0.0"
-
-pattern DISCOVERY_PORT :: (IsString a, Eq a) => a
-pattern DISCOVERY_PORT = "5227"
 
 getLocalAddress :: Maybe RCCtrlAddress -> IO [RCCtrlAddress]
 getLocalAddress preferred_ =
@@ -99,52 +86,3 @@ startTLSServer port_ startedOnPort credentials hooks server = async . liftIO $ d
           TLS.serverHooks = hooks,
           TLS.serverSupported = defaultSupportedParams
         }
-
-withSender :: (UDP.UDPSocket -> IO a) -> IO a
-withSender = bracket (UDP.clientSocket MULTICAST_ADDR_V4 DISCOVERY_PORT False) (UDP.close)
-
-withListener :: TMVar Int -> (UDP.ListenSocket -> IO a) -> IO a
-withListener subscribers = bracket (openListener subscribers) (closeListener subscribers)
-
-openListener :: TMVar Int -> IO UDP.ListenSocket
-openListener subscribers = do
-  sock <- UDP.serverSocket (MULTICAST_ADDR_V4, read DISCOVERY_PORT)
-  logDebug $ "Discovery listener socket: " <> tshow sock
-  let raw = UDP.listenSocket sock
-  -- N.setSocketOption raw N.Broadcast 1
-  joinMulticast subscribers raw (listenerHostAddr4 sock)
-  pure sock
-
-closeListener :: TMVar Int -> UDP.ListenSocket -> IO ()
-closeListener subscribers sock =
-  partMulticast subscribers (UDP.listenSocket sock) (listenerHostAddr4 sock) `finally` UDP.stop sock
-
-joinMulticast :: TMVar Int -> N.Socket -> N.HostAddress -> IO ()
-joinMulticast subscribers sock group = do
-  now <- atomically $ takeTMVar subscribers
-  if now == 0
-    then
-      setMembership sock group True >>= \case
-        Left e -> atomically (putTMVar subscribers now) >> logError ("setMembership failed " <> tshow e)
-        Right () -> atomically $ putTMVar subscribers (now + 1)
-    else atomically $ putTMVar subscribers (now + 1)
-
-partMulticast :: TMVar Int -> N.Socket -> N.HostAddress -> IO ()
-partMulticast subscribers sock group = do
-  now <- atomically $ takeTMVar subscribers
-  if now == 1
-    then
-      setMembership sock group False >>= \case
-        Left e -> atomically (putTMVar subscribers (now - 1)) >> logError ("setMembership failed " <> tshow e)
-        Right () -> atomically $ putTMVar subscribers (now - 1)
-    else atomically $ putTMVar subscribers (max 0 (now - 1))
-
-listenerHostAddr4 :: UDP.ListenSocket -> N.HostAddress
-listenerHostAddr4 sock = case UDP.mySockAddr sock of
-  N.SockAddrInet _port host -> host
-  _ -> error "MULTICAST_ADDR_V4 is V4"
-
-recvAnnounce :: UDP.ListenSocket -> IO (N.SockAddr, ByteString)
-recvAnnounce sock = do
-  (invite, UDP.ClientSockAddr source _cmsg) <- UDP.recvFrom sock
-  pure (source, invite)

@@ -10,7 +10,7 @@ module Simplex.RemoteControl.Invitation
   , RCSignedInvitation (..)
   , verifySignedInvitation
   , RCVerifiedInvitation (..)
-  , RCEncInvitation (..)
+  , invitationTsValid
   ) where
 
 import qualified Data.Aeson as J
@@ -18,12 +18,12 @@ import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as LB
-import Data.Time.Clock.System (SystemTime)
+import Data.Int (Int64)
+import Data.Time.Clock.System (SystemTime (..))
 import Data.Word (Word16)
 import Network.HTTP.Types (parseSimpleQuery)
 import Network.HTTP.Types.URI (SimpleQuery, renderSimpleQuery, urlDecode)
 import qualified Simplex.Messaging.Crypto as C
-import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (parseAll)
 import Simplex.Messaging.Transport.Client (TransportHost)
@@ -150,18 +150,15 @@ verifySignedInvitation RCSignedInvitation {invitation, ssig, idsig} =
     inviteURL = strEncode invitation
     inviteURLS = mconcat [inviteURL, "&ssig=", strEncode ssig]
 
-data RCEncInvitation = RCEncInvitation
-  { dhPubKey :: C.PublicKeyX25519,
-    nonce :: C.CbNonce,
-    encInvitation :: ByteString
-  }
+invitationTsValid :: SystemTime -> RCInvitation -> Bool
+invitationTsValid now RCInvitation {ts} =
+  systemSeconds now - invitationMaxAge <= systemSeconds ts && systemSeconds ts <= systemSeconds now + invitationMaxSkew
 
-instance Encoding RCEncInvitation where
-  smpEncode RCEncInvitation {dhPubKey, nonce, encInvitation} =
-    smpEncode (dhPubKey, nonce, Tail encInvitation)
-  smpP = do
-    (dhPubKey, nonce, Tail encInvitation) <- smpP
-    pure RCEncInvitation {dhPubKey, nonce, encInvitation}
+invitationMaxAge :: Int64
+invitationMaxAge = 3660
+
+invitationMaxSkew :: Int64
+invitationMaxSkew = 3600
 
 -- * Utils
 

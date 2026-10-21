@@ -146,7 +146,6 @@ module Simplex.Messaging.Agent
     rcNewHostPairing,
     rcConnectHost,
     rcConnectCtrl,
-    rcDiscoverCtrl,
     getAgentSubsTotal,
     getAgentServersSummary,
     resetAgentServersStats,
@@ -859,20 +858,15 @@ rcNewHostPairing :: AgentClient -> IO RCHostPairing
 rcNewHostPairing AgentClient {agentEnv = Env {random}} = newRCHostPairing random
 {-# INLINE rcNewHostPairing #-}
 
--- | start TLS server for remote host with optional multicast
-rcConnectHost :: AgentClient -> RCHostPairing -> J.Value -> Bool -> Maybe RCCtrlAddress -> Maybe Word16 -> AE RCHostConnection
-rcConnectHost AgentClient {agentEnv = Env {random}} = withExceptT RCP .::. connectRCHost random
+-- | start TLS server for remote host
+rcConnectHost :: AgentClient -> RCHostPairing -> J.Value -> Maybe RCCtrlAddress -> Maybe Word16 -> AE RCHostConnection
+rcConnectHost AgentClient {agentEnv = Env {random}} = withExceptT RCP .:: connectRCHost random
 {-# INLINE rcConnectHost #-}
 
 -- | connect to remote controller via URI
 rcConnectCtrl :: AgentClient -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> AE RCCtrlConnection
 rcConnectCtrl AgentClient {agentEnv = Env {random}} = withExceptT RCP .:. connectRCCtrl random
 {-# INLINE rcConnectCtrl #-}
-
--- | connect to known remote controller via multicast
-rcDiscoverCtrl :: AgentClient -> NonEmpty RCCtrlPairing -> AE (RCCtrlPairing, RCVerifiedInvitation)
-rcDiscoverCtrl AgentClient {agentEnv = Env {multicastSubscribers = subs}} = withExceptT RCP . discoverRCCtrl subs
-{-# INLINE rcDiscoverCtrl #-}
 
 resetAgentServersStats :: AgentClient -> AE ()
 resetAgentServersStats c = withAgentEnv c $ resetAgentServersStats' c
