@@ -4,7 +4,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -fno-warn-ambiguous-fields #-}
 
 module Simplex.RemoteControl.Client
@@ -29,7 +28,6 @@ module Simplex.RemoteControl.Client
 
 import Control.Logger.Simple
 import Control.Monad
-import Control.Monad.Except
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Except
 import Crypto.Random (ChaChaDRG)
@@ -40,15 +38,12 @@ import qualified Data.ByteString.Lazy as LB
 import Data.Default (def)
 import Data.Functor (($>))
 import Data.List.NonEmpty (NonEmpty (..))
-import qualified Data.List.NonEmpty as L
 import Data.Maybe (isNothing)
 import qualified Data.Text as T
 import Data.Time.Clock.System (getSystemTime)
 import Data.Tuple (swap)
-import Data.Word (Word16)
 import qualified Data.X509 as X
 import Data.X509.Validation (Fingerprint (..), getFingerprint)
-import Network.Socket (PortNumber)
 import qualified Network.TLS as TLS
 import Simplex.Messaging.Agent.Client ()
 import qualified Simplex.Messaging.Crypto as C
@@ -57,13 +52,13 @@ import qualified Simplex.Messaging.Crypto.Lazy as LC
 import Simplex.Messaging.Crypto.SNTRUP761
 import Simplex.Messaging.Crypto.SNTRUP761.Bindings
 import Simplex.Messaging.Encoding
-import Simplex.Messaging.Transport (TSbChainKeys (..), TLS (..), TransportPeer (..), cGet, cPut)
+import Simplex.Messaging.Transport (TSbChainKeys (..), TLS (..), TransportPeer (..), cGet, cPut, closeConnection, defaultSupportedParams)
 import Simplex.Messaging.Transport.Buffer (peekBuffered)
-import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTransportClient)
+import Simplex.Messaging.Transport.Client (TransportClientConfig (..), connectTLSClientBackend, defaultTransportClientConfig)
 import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
+import Simplex.Messaging.Transport.Server (connectTLSServerBackend, mkTransportServerConfig)
 import Simplex.Messaging.Util
 import Simplex.Messaging.Version
-import Simplex.RemoteControl.Discovery (getLocalAddress, startTLSServer)
 import Simplex.RemoteControl.Invitation
 import Simplex.RemoteControl.Types
 import UnliftIO
@@ -86,44 +81,36 @@ data RCHostClient = RCHostClient
   }
 
 data RCHClient_ = RCHClient_
-  { startedPort :: TMVar (Maybe PortNumber),
-    hostCAHash :: TMVar C.KeyHash,
+  { hostCAHash :: TMVar C.KeyHash,
     endSession :: TMVar ()
   }
 
-type RCHostConnection = (NonEmpty RCCtrlAddress, RCSignedInvitation, RCHostClient, RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)))
+type RCHostConnection = (RCSignedInvitation, RCHostClient, RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)))
 
-connectRCHost :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
-connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo rcAddrPrefs_ port_ = do
+connectRCHost :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> IO TLS.Backend -> ExceptT RCErrorType IO RCHostConnection
+connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo getBackend = do
   r <- newEmptyTMVarIO
-  found@(RCCtrlAddress {address} :| _) <- findCtrlAddress
-  c@RCHClient_ {startedPort} <- liftIO mkClient
+  c <- liftIO mkClient
   hostKeys <- atomically genHostKeys
-  action <- liftIO $ runClient c r hostKeys
-  -- wait for the port to make invitation
-  portNum <- atomically $ readTMVar startedPort
-  signedInv <- maybe (throwE RCETLSStartFailed) (liftIO . mkInvitation hostKeys address) portNum
-  pure (found, signedInv, RCHostClient {action, client_ = c}, r)
+  signedInv <- liftIO $ mkInvitation hostKeys
+  action <- liftIO . async . void . runExceptT $ runClient c r hostKeys `putRCError` r
+  pure (signedInv, RCHostClient {action, client_ = c}, r)
   where
-    findCtrlAddress :: ExceptT RCErrorType IO (NonEmpty RCCtrlAddress)
-    findCtrlAddress = do
-      found' <- liftIO $ getLocalAddress rcAddrPrefs_
-      maybe (throwE RCENoLocalAddress) pure $ L.nonEmpty found'
     mkClient :: IO RCHClient_
     mkClient = do
-      startedPort <- newEmptyTMVarIO
       endSession <- newEmptyTMVarIO
       hostCAHash <- newEmptyTMVarIO
-      pure RCHClient_ {startedPort, hostCAHash, endSession}
-    runClient :: RCHClient_ -> RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)) -> RCHostKeys -> IO (Async ())
-    runClient RCHClient_ {startedPort, hostCAHash, endSession} r hostKeys = do
-      tlsCreds <- genTLSCredentials drg caKey caCert
-      startTLSServer port_ startedPort tlsCreds (tlsHooks r knownHost hostCAHash) $ \tls ->
-        void . runExceptT $ do
-          r' <- newEmptyTMVarIO
-          whenM (atomically $ tryPutTMVar r $ Right (tlsUniq tls, tls, r')) $
-            runSession tls r' `putRCError` r'
+      pure RCHClient_ {hostCAHash, endSession}
+    runClient :: RCHClient_ -> RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)) -> RCHostKeys -> ExceptT RCErrorType IO ()
+    runClient RCHClient_ {hostCAHash, endSession} r hostKeys = do
+      tlsCreds <- liftIO $ genTLSCredentials drg caKey caCert
+      let params = serverParams tlsCreds $ tlsHooks r knownHost hostCAHash
+      ExceptT $ bracket (connectBackend params) closeConnection $ \tls -> runExceptT $ do
+        r' <- newEmptyTMVarIO
+        whenM (atomically $ tryPutTMVar r $ Right (tlsUniq tls, tls, r')) $
+          runSession tls r' `putRCError` r'
       where
+        connectBackend srvParams = bracketOnError getBackend TLS.backendClose $ connectTLSServerBackend (mkTransportServerConfig True Nothing True) srvParams
         runSession tls r' = do
           logDebug "Incoming TLS connection"
           hostEncHello <- receiveRCPacket tls
@@ -156,14 +143,12 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
       sessKeys <- C.generateKeyPair drg
       dhKeys <- C.generateKeyPair drg
       pure RCHostKeys {sessKeys, dhKeys}
-    mkInvitation :: RCHostKeys -> TransportHost -> PortNumber -> IO RCSignedInvitation
-    mkInvitation RCHostKeys {sessKeys, dhKeys} host portNum = do
+    mkInvitation :: RCHostKeys -> IO RCSignedInvitation
+    mkInvitation RCHostKeys {sessKeys, dhKeys} = do
       ts <- getSystemTime
       let inv =
             RCInvitation
               { ca = certFingerprint caCert,
-                host,
-                port = fromIntegral portNum,
                 v = supportedRCPVRange,
                 app = ctrlAppInfo,
                 ts,
@@ -172,6 +157,15 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
                 dh = fst dhKeys
               }
       pure $ signInvitation (snd sessKeys) idPrivKey inv
+
+serverParams :: TLS.Credential -> TLS.ServerHooks -> TLS.ServerParams
+serverParams credential hooks =
+  def
+    { TLS.serverWantClientCert = True,
+      TLS.serverShared = def {TLS.sharedCredentials = TLS.Credentials [credential]},
+      TLS.serverHooks = hooks,
+      TLS.serverSupported = defaultSupportedParams
+    }
 
 genTLSCredentials :: TVar ChaChaDRG -> C.APrivateSignKey -> X.SignedCertificate -> IO TLS.Credential
 genTLSCredentials drg caKey caCert = do
@@ -234,10 +228,10 @@ data RCCClient_ = RCCClient_
 type RCCtrlConnection = (RCCtrlClient, RCStepTMVar (SessionCode, TLS 'TClient, RCStepTMVar (RCCtrlSession, RCCtrlPairing)))
 
 -- app should determine whether it is a new or known pairing based on CA fingerprint in the invitation
-connectRCCtrl :: TVar ChaChaDRG -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> ExceptT RCErrorType IO RCCtrlConnection
-connectRCCtrl drg (RCVerifiedInvitation inv@RCInvitation {ca, idkey}) pairing_ hostAppInfo = do
+connectRCCtrl :: TVar ChaChaDRG -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> IO TLS.Backend -> ExceptT RCErrorType IO RCCtrlConnection
+connectRCCtrl drg (RCVerifiedInvitation inv@RCInvitation {ca, idkey}) pairing_ hostAppInfo getBackend = do
   pairing' <- maybe (liftIO newCtrlPairing) verifyCtrlPairing pairing_
-  connectRCCtrl_ drg pairing' inv hostAppInfo
+  connectRCCtrl_ drg pairing' inv hostAppInfo getBackend
   where
     newCtrlPairing :: IO RCCtrlPairing
     newCtrlPairing = do
@@ -248,8 +242,8 @@ connectRCCtrl drg (RCVerifiedInvitation inv@RCInvitation {ca, idkey}) pairing_ h
       unless (ca == ctrlFingerprint && idPubKey == idkey) $ throwE RCEIdentity
       pure pairing
 
-connectRCCtrl_ :: TVar ChaChaDRG -> RCCtrlPairing -> RCInvitation -> J.Value -> ExceptT RCErrorType IO RCCtrlConnection
-connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca, host, port} hostAppInfo = do
+connectRCCtrl_ :: TVar ChaChaDRG -> RCCtrlPairing -> RCInvitation -> J.Value -> IO TLS.Backend -> ExceptT RCErrorType IO RCCtrlConnection
+connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca} hostAppInfo getBackend = do
   r <- newEmptyTMVarIO
   c <- liftIO mkClient
   action <- liftIO . async . void . runExceptT $ runClient c r `putRCError` r
@@ -264,8 +258,8 @@ connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca, 
     runClient RCCClient_ {confirmSession, endSession} r = do
       clientCredentials <- liftIO $ Just <$> genTLSCredentials drg caKey caCert
       let clientConfig = defaultTransportClientConfig {clientCredentials}
-      ExceptT . runTransportClient clientConfig Nothing host (show port) (Just ca) $ \tls@TLS {tlsBuffer, tlsContext} -> runExceptT $ do
-        -- pump socket to detect connection problems
+      ExceptT $ bracket (connectBackend clientConfig) closeConnection $ \tls@TLS {tlsBuffer, tlsContext} -> runExceptT $ do
+        -- pump the backend to detect connection problems
         liftIO $ peekBuffered tlsBuffer 100000 (TLS.recvData tlsContext) >>= logDebug . tshow -- should normally be ("", Nothing) here
         logDebug "Got TLS connection"
         r' <- newEmptyTMVarIO
@@ -273,6 +267,7 @@ connectRCCtrl_ drg pairing'@RCCtrlPairing {caKey, caCert} inv@RCInvitation {ca, 
           logDebug "Waiting for session confirmation"
           whenM (atomically $ readTMVar confirmSession) $ runSession tls r' `putRCError` r'
       where
+        connectBackend cfg = bracketOnError getBackend TLS.backendClose $ connectTLSClientBackend cfg ca
         runSession tls r' = do
           (sharedKey, dhPrivKey, kemPrivKey, hostEncHello) <- prepareHostHello drg pairing' inv hostAppInfo
           sendRCPacket tls hostEncHello

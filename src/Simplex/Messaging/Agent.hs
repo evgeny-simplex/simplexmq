@@ -196,7 +196,8 @@ import qualified Data.Text as T
 import Data.Time.Clock
 import Data.Time.Clock.System (systemToUTCTime)
 import Data.Traversable (mapAccumL)
-import Data.Word (Word16, Word32)
+import Data.Word (Word32)
+import Network.TLS (Backend)
 import Simplex.FileTransfer.Agent (closeXFTPAgent, deleteSndFileInternal, deleteSndFileRemote, deleteSndFilesInternal, deleteSndFilesRemote, startXFTPSndWorkers, startXFTPWorkers, toFSFilePath, xftpDeleteRcvFile', xftpDeleteRcvFiles', xftpPrepareReceiveFile', xftpPrepareSendDescription', xftpPrepareSendFile', xftpReceiveFile', xftpSendDescription', xftpSendFile', xftpStartReceiveFile', xftpStartSendFile')
 import Simplex.FileTransfer.Description (ValidFileDescription)
 import Simplex.FileTransfer.Protocol (FileParty (..))
@@ -858,14 +859,14 @@ rcNewHostPairing :: AgentClient -> IO RCHostPairing
 rcNewHostPairing AgentClient {agentEnv = Env {random}} = newRCHostPairing random
 {-# INLINE rcNewHostPairing #-}
 
--- | start TLS server for remote host
-rcConnectHost :: AgentClient -> RCHostPairing -> J.Value -> Maybe RCCtrlAddress -> Maybe Word16 -> AE RCHostConnection
-rcConnectHost AgentClient {agentEnv = Env {random}} = withExceptT RCP .:: connectRCHost random
+-- | start remote host session over the backend returned by the action
+rcConnectHost :: AgentClient -> RCHostPairing -> J.Value -> IO Backend -> AE RCHostConnection
+rcConnectHost AgentClient {agentEnv = Env {random}} = withExceptT RCP .:. connectRCHost random
 {-# INLINE rcConnectHost #-}
 
--- | connect to remote controller via URI
-rcConnectCtrl :: AgentClient -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> AE RCCtrlConnection
-rcConnectCtrl AgentClient {agentEnv = Env {random}} = withExceptT RCP .:. connectRCCtrl random
+-- | connect to remote controller via URI over the backend returned by the action
+rcConnectCtrl :: AgentClient -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> IO Backend -> AE RCCtrlConnection
+rcConnectCtrl AgentClient {agentEnv = Env {random}} = withExceptT RCP .:: connectRCCtrl random
 {-# INLINE rcConnectCtrl #-}
 
 resetAgentServersStats :: AgentClient -> AE ()

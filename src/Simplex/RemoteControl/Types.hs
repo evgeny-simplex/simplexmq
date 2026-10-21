@@ -126,10 +126,10 @@ pattern VersionRCP :: Word16 -> VersionRCP
 pattern VersionRCP v = Version v
 
 currentRCPVersion :: VersionRCP
-currentRCPVersion = VersionRCP 1
+currentRCPVersion = VersionRCP 2
 
 supportedRCPVRange :: VersionRangeRCP
-supportedRCPVRange = mkVersionRange (VersionRCP 1) currentRCPVersion
+supportedRCPVRange = mkVersionRange (VersionRCP 2) currentRCPVersion
 
 -- * Session
 
