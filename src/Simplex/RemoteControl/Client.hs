@@ -231,7 +231,7 @@ data RCCClient_ = RCCClient_
 
 type RCCtrlConnection = (RCCtrlClient, RCStepTMVar (SessionCode, TLS 'TClient, RCStepTMVar (RCCtrlSession, RCCtrlPairing)))
 
--- app should determine whether it is a new or known pairing based on CA fingerprint in the invitation
+-- the app passes the stored pairing of a known controller (its CA and identity key must match the invitation), or Nothing for a new one
 connectRCCtrl :: TVar ChaChaDRG -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> IO TLS.Backend -> ExceptT RCErrorType IO RCCtrlConnection
 connectRCCtrl drg (RCVerifiedInvitation inv@RCInvitation {ca, idkey}) pairing_ hostAppInfo getBackend = do
   pairing' <- maybe (liftIO newCtrlPairing) verifyCtrlPairing pairing_
