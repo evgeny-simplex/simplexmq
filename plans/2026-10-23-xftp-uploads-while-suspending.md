@@ -1,7 +1,7 @@
 # XFTP uploads while the agent is suspending
 
 On iOS, a file sent shortly before the app left the foreground was delivered only after the app was opened again: once the agent began to suspend, the next chunk was not started, and the result of the chunk in flight was recorded only in foreground.
-While the agent is suspending, it continues the uploads that it started in foreground. Their files are counted by a new operation, `AOSndFiles`, with its own count and set, in a stage between `AORcvNetwork` and `AOMsgDelivery`; the next stage is entered after the chat deletes these files; at the suspend timeout, the stage of `AOSndNetwork` is entered if the agent is still suspending.
+While the agent is suspending, it continues the uploads that it started in foreground. Their files are counted by a new operation, `AOSndFiles`, with its own count and set, in a stage between `AORcvNetwork` and `AOMsgDelivery`; the next stage is entered after these files are deleted by the chat or removed by TTL cleanup; at the suspend timeout, the stage of `AOSndNetwork` is entered if the agent is still suspending.
 
 Chat side: https://github.com/evgeny-simplex/simplex-chat/pull/5
 
@@ -18,16 +18,16 @@ Chat side: https://github.com/evgeny-simplex/simplex-chat/pull/5
   | 5 | `AODatabase` | database transactions | `SUSPENDED` sent; agent state `ASSuspended` |
 
   - The actions of "At count 0" are taken only while the agent state is `ASSuspending`.
-  - `AONtfNetwork` is suspended at the start; no stage is delayed by its count.
-  - After the timeout, if the agent is still suspending, stage 4 is entered whatever stage is in progress, and stage 5 is entered by the same rule.
+  - `AONtfNetwork` is suspended at the start; the stages are entered independently of its count.
+  - After the timeout, if the agent is still suspending, stage 4 is entered whatever stage is in progress; stage 5 is entered when the count of stage 4 is 0, as in the table.
 - Counted files, the set `sndFilesInProgress`:
   - inserted: files started by `xftpStartSendFile'` while the agent state is `ASForeground`;
   - removed:
-    - files deleted by `deleteSndFilesInternal`, after its database work, also after an exception;
+    - files deleted by `deleteSndFilesInternal`, after its database work, also when an exception is thrown;
     - files expired by TTL cleanup, before their prefix path and row are deleted.
 - `deleteSndFilesInternal` is run by `xftpDeleteSndFileInternal`, which is called by the chat after `SFDONE` and `SFERR`.
 - Uncounted files:
-  - files resumed at worker start;
+  - files resumed at worker start, unless they remain in the set from their start in foreground;
   - files started while suspending or suspended.
 - Gate of the send prepare and upload workers:
 
@@ -100,7 +100,7 @@ remove f                       f in set -> delete f; endAgentOperation AOSndFile
   - file 1 of 128 KB and file 2 of 17 MB started, suspend timeout 60 s;
   - `xftpDeleteSndFileInternal` of file 1, twice;
   - `SFDONE` of file 2 within 30 s; `SUSPENDED` before it: test failure;
-  - after `xftpDeleteSndFileInternal` of file 2, `SUSPENDED` within 5 s.
+  - after `xftpDeleteSndFileInternal` of file 2, `SUSPENDED` within 5 s; events of file 1 before it are skipped.
 
 `tests/AgentTests/FunctionalAPITests.hs`, "Suspending agent":
 - "should send messages queued after file is sent before agent is suspended" (:3137):
@@ -116,9 +116,9 @@ remove f                       f in set -> delete f; endAgentOperation AOSndFile
    - in the shared database:
      - the upload of the file is completed by the share extension;
      - the file is deleted by the share extension or the NSE;
-     - the file is marked deleted by the share extension or the NSE; `deleteSndFilesDeleted` in this process then deletes such rows without `removeSndFileInProgress`;
+     - the file is marked deleted by the share extension or the NSE; such rows are then deleted in this process by `deleteSndFilesDeleted`, without `removeSndFileInProgress`;
    - the chat's subscriber is cancelled by `stopChatController` (simplex-chat `src/Simplex/Chat/Library/Commands.hs:371`, run by `APIStopChat`) during `SFDONE` handling, before the deletion of the agent file;
-   - the upload worker is stopped by `stopChatController` after the last chunk is recorded as uploaded (`src/Simplex/FileTransfer/Agent.hs:564`) and before `SFDONE` is queued (:577): the row is left with status `SFSUploading` without pending replicas, or with status `SFSComplete`; neither worker selects it, and `SFDONE` is never queued;
+   - the upload worker is stopped by `stopChatController` after the last chunk is recorded as uploaded (`src/Simplex/FileTransfer/Agent.hs:564`) and before `SFDONE` is queued (:577): the row is left in status `SFSUploading`, with every chunk uploaded, or `SFSComplete`; neither worker selects it, and `SFDONE` is never queued;
    - the agent fails to load a work item: the file is marked `failed = 1` without `SFERR`.
 
    Recommended:
