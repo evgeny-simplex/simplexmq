@@ -92,6 +92,7 @@ xftpAgentTests =
       it "should complete sending file while agent is suspending" testXFTPAgentSuspendSending
       it "should suspend on timeout when file is not sent" $ \_ -> testXFTPAgentSuspendTimeout
       it "should not wait for file started while agent is suspending" testXFTPAgentSuspendNewFile
+      it "should continue sending file when another file is deleted twice while agent is suspending" testXFTPAgentSuspendDeleteTwice
       describe "XFTP server test via agent API" $ do
         it "should pass without basic auth" $ \_ -> testXFTPServerTest Nothing (noAuthSrv testXFTPServer2) `shouldReturn` Right (Just (Right testServerInformation))
         let srv1 :: HasTestEnv => XFTPServer
@@ -620,15 +621,14 @@ testXFTPAgentSuspendSending = withXFTPServer $ do
   withAgent 1 agentCfg initAgentServers testDB $ \sndr -> runRight_ $ do
     xftpStartWorkers sndr (Just senderFiles)
     sfId <- xftpSendFile sndr 1 (CF.plain filePath) 2
-    liftIO $ XA.suspendAgent sndr 10000000
-    liftIO $ timeout 10000000 (sfProgress sndr $ mb 18) `shouldReturn` Just ()
+    liftIO $ XA.suspendAgent sndr 60000000
+    liftIO $ timeout 30000000 (sfProgress sndr $ mb 18) `shouldReturn` Just ()
     ("", sfId', SFDONE _ [_, _]) <- sfGet sndr
     liftIO $ do
       sfId' `shouldBe` sfId
       timeout 300000 (nGet sndr) `shouldReturn` Nothing
       xftpDeleteSndFileInternal sndr sfId
-    ("", "", SUSPENDED) <- nGet sndr
-    pure ()
+      timeout 5000000 (nGet sndr) `shouldReturn` Just ("", "", SUSPENDED)
 
 testXFTPAgentSuspendTimeout :: (HasCallStack, HasTestEnv) => IO ()
 testXFTPAgentSuspendTimeout = withGlobalLogging logCfgNoLogs $ do
@@ -653,24 +653,41 @@ testXFTPAgentSuspendNewFile = withXFTPServer $ do
   withAgent 1 agentCfg initAgentServers testDB $ \sndr -> runRight_ $ do
     xftpStartWorkers sndr (Just senderFiles)
     sfId1 <- xftpSendFile sndr 1 (CF.plain filePath1) 1
-    liftIO $ XA.suspendAgent sndr 10000000
+    liftIO $ XA.suspendAgent sndr 60000000
     sfId2 <- xftpSendFile sndr 1 (CF.plain filePath2) 1
     liftIO $ do
-      timeout 10000000 (waitSndFileDone sndr sfId1) `shouldReturn` Just ()
+      timeout 30000000 (waitSndFileDone sndr sfId1) `shouldReturn` Just ()
       xftpDeleteSndFileInternal sndr sfId1
-      timeout 10000000 (waitSuspended sndr sfId2) `shouldReturn` Just ()
-  where
-    waitSndFileDone :: AgentClient -> SndFileId -> IO ()
-    waitSndFileDone sndr sfId =
-      sfGet sndr >>= \case
-        ("", sfId', SFDONE _ _) | sfId' == sfId -> pure ()
-        _ -> waitSndFileDone sndr sfId
-    waitSuspended :: AgentClient -> SndFileId -> IO ()
-    waitSuspended sndr sfId2 =
-      pGet sndr >>= \case
-        ("", "", AEvt SAENone SUSPENDED) -> pure ()
-        ("", sfId', AEvt SAESndFile _) | sfId' == sfId2 -> waitSuspended sndr sfId2
-        t -> expectationFailure $ "unexpected event: " <> show t
+      timeout 5000000 (waitSuspended sndr sfId2) `shouldReturn` Just ()
+
+testXFTPAgentSuspendDeleteTwice :: (HasCallStack, HasTestEnv) => AFStoreType -> IO ()
+testXFTPAgentSuspendDeleteTwice = withXFTPServer $ do
+  filePath1 <- createRandomFile_ (kb 128 :: Integer) "testfile1"
+  filePath2 <- createRandomFile' "testfile2"
+  withAgent 1 agentCfg initAgentServers testDB $ \sndr -> runRight_ $ do
+    xftpStartWorkers sndr (Just senderFiles)
+    sfId1 <- xftpSendFile sndr 1 (CF.plain filePath1) 1
+    sfId2 <- xftpSendFile sndr 1 (CF.plain filePath2) 1
+    liftIO $ do
+      XA.suspendAgent sndr 60000000
+      xftpDeleteSndFileInternal sndr sfId1
+      xftpDeleteSndFileInternal sndr sfId1
+      timeout 30000000 (waitSndFileDone sndr sfId2) `shouldReturn` Just ()
+      xftpDeleteSndFileInternal sndr sfId2
+      timeout 5000000 (waitSuspended sndr sfId1) `shouldReturn` Just ()
+
+waitSndFileDone :: AgentClient -> SndFileId -> IO ()
+waitSndFileDone sndr sfId =
+  sfGet sndr >>= \case
+    ("", sfId', SFDONE _ _) | sfId' == sfId -> pure ()
+    _ -> waitSndFileDone sndr sfId
+
+waitSuspended :: AgentClient -> SndFileId -> IO ()
+waitSuspended sndr sfId =
+  pGet sndr >>= \case
+    ("", "", AEvt SAENone SUSPENDED) -> pure ()
+    ("", sfId', AEvt SAESndFile _) | sfId' == sfId -> waitSuspended sndr sfId
+    t -> expectationFailure $ "unexpected event: " <> show t
 
 testXFTPAgentDelete :: (HasCallStack, HasTestEnv) => AFStoreType -> IO ()
 testXFTPAgentDelete = withGlobalLogging logCfgNoLogs . withXFTPServer test

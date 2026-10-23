@@ -89,7 +89,7 @@ import SMPAgentClient
 import SMPClient
 import Simplex.Messaging.Agent hiding (acceptContact, createConnection, deleteConnection, deleteConnections, getConnShortLink, joinConnection, sendMessage, setConnShortLink, subscribeConnection, suspendConnection)
 import qualified Simplex.Messaging.Agent as A
-import Simplex.Messaging.Agent.Client (ProtocolTestFailure (..), ProtocolTestStep (..), ServerQueueInfo (..), UserNetworkInfo (..), UserNetworkType (..), sendAgentMessage, waitForUserNetwork)
+import Simplex.Messaging.Agent.Client (AgentOpState (..), ProtocolTestFailure (..), ProtocolTestStep (..), ServerQueueInfo (..), UserNetworkInfo (..), UserNetworkType (..), sendAgentMessage, waitForUserNetwork)
 import Simplex.Messaging.Agent.Env.SQLite (AgentConfig (..), Env (..), InitialAgentServers (..), createAgentStore)
 import Simplex.Messaging.Agent.Protocol hiding (CON, CONF, INFO, REQ, SENT)
 import qualified Simplex.Messaging.Agent.Protocol as A
@@ -3142,15 +3142,25 @@ testSuspendingAgentCompleteSendingFile ps =
     liftIO $ B.writeFile filePath "file content"
     xftpStartWorkers b (Just senderFiles)
     sfId <- xftpSendFile b 1 (CryptoFile filePath Nothing) 1 Nothing
-    liftIO $ suspendAgent b 10000000
+    liftIO $ do
+      suspendAgent b 60000000
+      timeout 5000000 (waitSuspendedOp b sndFilesOp) `shouldReturn` Just ()
+      suspendedOps b `shouldReturn` [True, True, False]
     ("", _, SFPROG _ _) <- sfGet b
     ("", sfId', SFDONE {}) <- sfGet b
     liftIO $ sfId' `shouldBe` sfId
     msgId <- sendMessage b aId SMP.noMsgFlags "file description"
-    liftIO $ xftpDeleteSndFileInternal b sfId
+    liftIO $ do
+      xftpDeleteSndFileInternal b sfId
+      suspendedOps b `shouldReturn` [True, True, True]
     get b ##> ("", aId, SENT msgId)
-    nGet b ##> ("", "", SUSPENDED)
+    liftIO $ timeout 5000000 (nGet b) `shouldReturn` Just ("", "", SUSPENDED)
     get a =##> \case ("", c, Msg "file description") -> c == bId; _ -> False
+  where
+    waitSuspendedOp :: AgentClient -> (AgentClient -> TVar AgentOpState) -> IO ()
+    waitSuspendedOp c op = atomically $ readTVar (op c) >>= checkSTM . opSuspended
+    suspendedOps :: AgentClient -> IO [Bool]
+    suspendedOps c = mapM (\op -> opSuspended <$> readTVarIO (op c)) [rcvNetworkOp, sndFilesOp, msgDeliveryOp]
 
 testBatchedSubscriptions :: HasTestEnv => Int -> Int -> (ASrvTransport, AStoreType) -> IO ()
 testBatchedSubscriptions nCreate nDel ps@(t, ASType qsType _) = do
