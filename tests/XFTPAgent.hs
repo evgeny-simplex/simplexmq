@@ -36,11 +36,13 @@ import Simplex.FileTransfer.Transport (XFTPErrorType (AUTH))
 import Simplex.FileTransfer.Types (RcvFileId, SndFileId)
 import Simplex.Messaging.Agent (AgentClient, testProtocolServer, xftpDeleteRcvFile, xftpDeleteSndFileInternal, xftpDeleteSndFileRemote, xftpPrepareReceiveFile, xftpPrepareSendFile, xftpReceiveFile, xftpSendDescription, xftpStartReceiveFile, xftpStartSendFile, xftpStartWorkers)
 import qualified Simplex.Messaging.Agent as XA
-import Simplex.Messaging.Agent.Client (ProtocolTestFailure (..), ProtocolTestStep (..))
+import Simplex.Messaging.Agent.Client (ProtocolTestFailure (..), ProtocolTestStep (..), agentClientStore)
 import Simplex.Messaging.Agent.Env.SQLite (AgentConfig, xftpCfg)
 import qualified Simplex.Messaging.Agent.Env.SQLite as AEnv
 import Simplex.Messaging.Agent.Protocol hiding (SFDONE)
 import qualified Simplex.Messaging.Agent.Protocol as A
+import Simplex.Messaging.Agent.Store.Common (withTransaction)
+import qualified Simplex.Messaging.Agent.Store.DB as DB
 import Simplex.Messaging.Client (pattern NRMInteractive)
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.BBS (bbsKeyGen)
@@ -93,6 +95,14 @@ xftpAgentTests =
       it "should suspend on timeout when file is not sent" $ \_ -> testXFTPAgentSuspendTimeout
       it "should not wait for file started while agent is suspending" testXFTPAgentSuspendNewFile
       it "should continue sending file when another file is deleted twice while agent is suspending" testXFTPAgentSuspendDeleteTwice
+      it "should wait for complete file until it is deleted while agent is suspending" testXFTPAgentSuspendCompleteFile
+      it "should not wait for file deleted from database while agent is suspending" $ \_ ->
+        testXFTPAgentSuspendAfter $ \sndr -> withTransaction (agentClientStore sndr) (`DB.execute_` "DELETE FROM snd_files")
+      it "should not wait for file marked failed while agent is suspending" $ \_ ->
+        testXFTPAgentSuspendAfter $ \sndr -> withTransaction (agentClientStore sndr) (`DB.execute_` "UPDATE snd_files SET failed = 1")
+      it "should not wait for file after agent client is closed" $ \_ ->
+        testXFTPAgentSuspendAfter $ \sndr -> XA.disconnectAgentClient sndr >> XA.resumeAgentClient sndr
+      it "should not block suspending while database is suspended" $ \_ -> testXFTPAgentSuspendDatabaseSuspended
       describe "XFTP server test via agent API" $ do
         it "should pass without basic auth" $ \_ -> testXFTPServerTest Nothing (noAuthSrv testXFTPServer2) `shouldReturn` Right (Just (Right testServerInformation))
         let srv1 :: HasTestEnv => XFTPServer
@@ -675,6 +685,40 @@ testXFTPAgentSuspendDeleteTwice = withXFTPServer $ do
       timeout 30000000 (waitSndFileDone sndr sfId2) `shouldReturn` Just ()
       xftpDeleteSndFileInternal sndr sfId2
       timeout 5000000 (waitSuspended sndr sfId1) `shouldReturn` Just ()
+
+testXFTPAgentSuspendCompleteFile :: (HasCallStack, HasTestEnv) => AFStoreType -> IO ()
+testXFTPAgentSuspendCompleteFile = withXFTPServer $ do
+  filePath <- createRandomFile_ (kb 128 :: Integer) "testfile"
+  withAgent 1 agentCfg initAgentServers testDB $ \sndr -> runRight_ $ do
+    xftpStartWorkers sndr (Just senderFiles)
+    sfId <- xftpSendFile sndr 1 (CF.plain filePath) 1
+    liftIO $ do
+      timeout 30000000 (waitSndFileDone sndr sfId) `shouldReturn` Just ()
+      XA.suspendAgent sndr 60000000
+      timeout 300000 (nGet sndr) `shouldReturn` Nothing
+      xftpDeleteSndFileInternal sndr sfId
+      timeout 5000000 (nGet sndr) `shouldReturn` Just ("", "", SUSPENDED)
+
+testXFTPAgentSuspendAfter :: (HasCallStack, HasTestEnv) => (AgentClient -> IO ()) -> IO ()
+testXFTPAgentSuspendAfter action = withGlobalLogging logCfgNoLogs $ do
+  filePath <- createRandomFile_ (kb 128 :: Integer) "testfile"
+  withAgent 1 agentCfg initAgentServers testDB $ \sndr -> do
+    sfId <- runRight $ do
+      xftpStartWorkers sndr (Just senderFiles)
+      xftpSendFile sndr 1 (CF.plain filePath) 1
+    action sndr
+    XA.suspendAgent sndr 60000000
+    timeout 5000000 (waitSuspended sndr sfId) `shouldReturn` Just ()
+
+testXFTPAgentSuspendDatabaseSuspended :: (HasCallStack, HasTestEnv) => IO ()
+testXFTPAgentSuspendDatabaseSuspended = withGlobalLogging logCfgNoLogs $ do
+  filePath <- createRandomFile_ (kb 128 :: Integer) "testfile"
+  withAgent 1 agentCfg initAgentServers testDB $ \sndr -> do
+    runRight_ $ do
+      xftpStartWorkers sndr (Just senderFiles)
+      void $ xftpSendFile sndr 1 (CF.plain filePath) 1
+    XA.suspendAgent sndr 0
+    timeout 5000000 (XA.suspendAgent sndr 60000000) `shouldReturn` Just ()
 
 waitSndFileDone :: AgentClient -> SndFileId -> IO ()
 waitSndFileDone sndr sfId =
