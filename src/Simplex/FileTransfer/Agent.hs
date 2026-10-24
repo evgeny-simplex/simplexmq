@@ -420,7 +420,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
   cfg <- asks config
   forever $ do
     lift $ waitForWork doWork
-    liftIO $ assertSndFilesActive c
+    liftIO $ assertUploadsAllowed c
     runXFTPOperation cfg
   where
     runXFTPOperation :: AgentConfig -> AM ()
@@ -483,7 +483,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
           SndFileChunkReplica {server} : _ -> Right server
         createChunk :: Int -> Maybe Word32 -> SndFileChunk -> AM (ProtocolServer 'PXFTP)
         createChunk numRecipients' storageHours ch = do
-          liftIO $ assertSndFilesActive c
+          liftIO $ assertUploadsAllowed c
           (replica, ProtoServerWithAuth srv _) <- tryCreate
           withStore' c $ \db -> createSndFileReplica db ch replica
           pure srv
@@ -503,7 +503,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
                 retryLoop loop triedAllSrvs e = do
                   flip catchAllErrors (\_ -> pure ()) $ do
                     when (triedAllSrvs && serverHostError e) $ notify c sndFileEntityId $ SFWARN e
-                  liftIO $ assertSndFilesActive c
+                  liftIO $ assertUploadsAllowed c
                   loop
             createWithNextSrv triedHosts = do
               deleted <- withStore' c $ \db -> getSndFileDeleted db sndFileId
@@ -524,7 +524,7 @@ runXFTPSndWorker c srv Worker {doWork} = do
   cfg <- asks config
   forever $ do
     lift $ waitForWork doWork
-    liftIO $ assertSndFilesActive c
+    liftIO $ assertUploadsAllowed c
     runXFTPOperation cfg
   where
     runXFTPOperation :: AgentConfig -> AM ()
@@ -545,7 +545,7 @@ runXFTPSndWorker c srv Worker {doWork} = do
                 when (serverHostError e) $ notify c sndFileEntityId $ SFWARN e
                 liftIO $ closeXFTPServerClient c userId server digest
                 withStore' c $ \db -> updateSndChunkReplicaDelay db sndChunkReplicaId replicaDelay
-              liftIO $ assertSndFilesActive c
+              liftIO $ assertUploadsAllowed c
               loop
             retryDone e = do
               atomically $ incXFTPServerStat c userId srv uploadErrs
@@ -556,9 +556,9 @@ runXFTPSndWorker c srv Worker {doWork} = do
       fsFilePath <- lift $ toFSFilePath filePath
       unlessM (doesFileExist fsFilePath) $ throwE $ FILE NO_FILE
       let chunkSpec' = chunkSpec {filePath = fsFilePath} :: XFTPChunkSpec
-      liftIO $ assertSndFilesActive c
+      liftIO $ assertUploadsAllowed c
       agentXFTPUploadChunk c userId chunkDigest replica' chunkSpec'
-      liftIO $ waitWhileSndFilesSuspended c
+      liftIO $ waitUntilUploadsAllowed c
       sf@SndFile {sndFileEntityId, prefixPath, chunks} <- withStore c $ \db -> do
         lockSndFileForUpdate db sndFileId
         updateSndChunkReplicaStatus db sndChunkReplicaId SFRSUploaded
@@ -745,7 +745,7 @@ assertAgentForeground c = do
   throwWhenInactive c
   waitUntilForeground c
 
-assertSndFilesActive :: AgentClient -> IO ()
-assertSndFilesActive c = do
+assertUploadsAllowed :: AgentClient -> IO ()
+assertUploadsAllowed c = do
   throwWhenInactive c
-  waitWhileSndFilesSuspended c
+  waitUntilUploadsAllowed c

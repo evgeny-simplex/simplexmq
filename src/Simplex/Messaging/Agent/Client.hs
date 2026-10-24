@@ -162,8 +162,8 @@ module Simplex.Messaging.Agent.Client
     whenSuspending,
     addSndFileInProgress,
     removeSndFileInProgress,
-    removeEndedSndFilesInProgress,
-    waitWhileSndFilesSuspended,
+    removeDeletedOrFailedSndFilesInProgress,
+    waitUntilUploadsAllowed,
     withStore,
     withStore',
     withStoreBatch,
@@ -2430,15 +2430,15 @@ removeSndFileInProgress c fId = do
   removed <- stateTVar (sndFilesInProgress c) $ \fs -> (S.member fId fs, S.delete fId fs)
   when removed $ endAgentOperation c AOSndFiles
 
-removeEndedSndFilesInProgress :: AgentClient -> IO ()
-removeEndedSndFilesInProgress c = do
+removeDeletedOrFailedSndFilesInProgress :: AgentClient -> IO ()
+removeDeletedOrFailedSndFilesInProgress c = do
   fIds <- readTVarIO $ sndFilesInProgress c
   unless (S.null fIds) $
     E.bracket (atomically $ tryBeginAgentOperation c AODatabase) endDatabaseOperation $ \begun ->
       when begun $
-        E.tryAny (withTransaction (agentClientStore c) getActiveSndFileIds) >>= \case
-          Right activeIds -> atomically $ mapM_ (removeSndFileInProgress c) $ fIds `S.difference` S.fromList activeIds
-          Left e -> logError $ "removeEndedSndFilesInProgress error: " <> tshow e
+        E.tryAny (withTransaction (agentClientStore c) getNotDeletedOrFailedSndFileIds) >>= \case
+          Right fIds' -> atomically $ mapM_ (removeSndFileInProgress c) $ fIds `S.difference` S.fromList fIds'
+          Left e -> logError $ "removeDeletedOrFailedSndFilesInProgress error: " <> tshow e
   where
     endDatabaseOperation begun = when begun $ atomically $ endAgentOperation c AODatabase
 
@@ -2477,10 +2477,10 @@ waitWhileSuspended c =
     suspended :: Monad m => (TVar AgentState -> m AgentState) -> m Bool
     suspended rd = (ASSuspended ==) <$> rd (agentState c)
 
-waitWhileSndFilesSuspended :: AgentClient -> IO ()
-waitWhileSndFilesSuspended c = atomically $ unlessM sndFilesActive retry
+waitUntilUploadsAllowed :: AgentClient -> IO ()
+waitUntilUploadsAllowed c = atomically $ unlessM uploadsAllowed retry
   where
-    sndFilesActive =
+    uploadsAllowed =
       readTVar (agentState c) >>= \case
         ASForeground -> pure True
         ASSuspending -> do
