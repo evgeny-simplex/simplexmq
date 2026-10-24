@@ -2452,10 +2452,7 @@ beginAgentOperation c op = do
   writeTVar opVar $! s {opsInProgress = opsInProgress s + 1}
 
 tryBeginAgentOperation :: AgentClient -> AgentOperation -> STM Bool
-tryBeginAgentOperation c op = do
-  suspended <- opSuspended <$> readTVar (agentOpSel op c)
-  unless suspended $ beginAgentOperation c op
-  pure $ not suspended
+tryBeginAgentOperation c op = (True <$ beginAgentOperation c op) `orElse` pure False
 
 agentOperationBracket :: MonadUnliftIO m => AgentClient -> AgentOperation -> (AgentClient -> IO ()) -> m a -> m a
 agentOperationBracket c op check action =
