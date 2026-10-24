@@ -403,6 +403,7 @@ xftpPrepareSendDescription' c userId (ValidFileDescription fdDirect@FileDescript
 xftpStartSendFile' :: AgentClient -> SndFileId -> AM ()
 xftpStartSendFile' c sndFileEntityId = do
   withStore c (`startPreparedSndFile` sndFileEntityId)
+  atomically . whenM ((ASForeground ==) <$> readTVar (agentState c)) $ addSndFileInProgress c sndFileEntityId
   lift . void $ getXFTPSndWorker True c Nothing
 
 resumeXFTPSndWork :: AgentClient -> Maybe XFTPServer -> AM' ()
@@ -419,7 +420,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
   cfg <- asks config
   forever $ do
     lift $ waitForWork doWork
-    liftIO $ assertAgentForeground c
+    liftIO $ assertUploadsAllowed c
     runXFTPOperation cfg
   where
     runXFTPOperation :: AgentConfig -> AM ()
@@ -482,7 +483,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
           SndFileChunkReplica {server} : _ -> Right server
         createChunk :: Int -> Maybe Word32 -> SndFileChunk -> AM (ProtocolServer 'PXFTP)
         createChunk numRecipients' storageHours ch = do
-          liftIO $ assertAgentForeground c
+          liftIO $ assertUploadsAllowed c
           (replica, ProtoServerWithAuth srv _) <- tryCreate
           withStore' c $ \db -> createSndFileReplica db ch replica
           pure srv
@@ -502,7 +503,7 @@ runXFTPSndPrepareWorker c Worker {doWork} = do
                 retryLoop loop triedAllSrvs e = do
                   flip catchAllErrors (\_ -> pure ()) $ do
                     when (triedAllSrvs && serverHostError e) $ notify c sndFileEntityId $ SFWARN e
-                  liftIO $ assertAgentForeground c
+                  liftIO $ assertUploadsAllowed c
                   loop
             createWithNextSrv triedHosts = do
               deleted <- withStore' c $ \db -> getSndFileDeleted db sndFileId
@@ -523,7 +524,7 @@ runXFTPSndWorker c srv Worker {doWork} = do
   cfg <- asks config
   forever $ do
     lift $ waitForWork doWork
-    liftIO $ assertAgentForeground c
+    liftIO $ assertUploadsAllowed c
     runXFTPOperation cfg
   where
     runXFTPOperation :: AgentConfig -> AM ()
@@ -544,7 +545,7 @@ runXFTPSndWorker c srv Worker {doWork} = do
                 when (serverHostError e) $ notify c sndFileEntityId $ SFWARN e
                 liftIO $ closeXFTPServerClient c userId server digest
                 withStore' c $ \db -> updateSndChunkReplicaDelay db sndChunkReplicaId replicaDelay
-              liftIO $ assertAgentForeground c
+              liftIO $ assertUploadsAllowed c
               loop
             retryDone e = do
               atomically $ incXFTPServerStat c userId srv uploadErrs
@@ -555,9 +556,9 @@ runXFTPSndWorker c srv Worker {doWork} = do
       fsFilePath <- lift $ toFSFilePath filePath
       unlessM (doesFileExist fsFilePath) $ throwE $ FILE NO_FILE
       let chunkSpec' = chunkSpec {filePath = fsFilePath} :: XFTPChunkSpec
-      liftIO $ assertAgentForeground c
+      liftIO $ assertUploadsAllowed c
       agentXFTPUploadChunk c userId chunkDigest replica' chunkSpec'
-      liftIO $ waitUntilForeground c
+      liftIO $ waitUntilUploadsAllowed c
       sf@SndFile {sndFileEntityId, prefixPath, chunks} <- withStore c $ \db -> do
         lockSndFileForUpdate db sndFileId
         updateSndChunkReplicaStatus db sndChunkReplicaId SFRSUploaded
@@ -658,7 +659,7 @@ deleteSndFileInternal :: AgentClient -> SndFileId -> AM' ()
 deleteSndFileInternal c sndFileEntityId = deleteSndFilesInternal c [sndFileEntityId]
 
 deleteSndFilesInternal :: AgentClient -> [SndFileId] -> AM' ()
-deleteSndFilesInternal c sndFileEntityIds = do
+deleteSndFilesInternal c sndFileEntityIds = flip E.finally (atomically $ mapM_ (removeSndFileInProgress c) sndFileEntityIds) $ do
   sndFiles <- rights <$> withStoreBatch c (\db -> map (fmap (first storeError) . getSndFileByEntityId db) sndFileEntityIds)
   let (toDelete, toMarkDeleted) = partition fileComplete sndFiles
   workPath <- getXFTPWorkPath
@@ -743,3 +744,8 @@ assertAgentForeground :: AgentClient -> IO ()
 assertAgentForeground c = do
   throwWhenInactive c
   waitUntilForeground c
+
+assertUploadsAllowed :: AgentClient -> IO ()
+assertUploadsAllowed c = do
+  throwWhenInactive c
+  waitUntilUploadsAllowed c

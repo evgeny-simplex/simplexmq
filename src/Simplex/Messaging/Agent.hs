@@ -3439,13 +3439,14 @@ suspendAgent c 0 = do
   where
     suspend opSel = atomically $ modifyTVar' (opSel c) $ \s -> s {opSuspended = True}
 suspendAgent c@AgentClient {agentState = as} maxDelay = do
+  removeDeletedOrFailedSndFilesInProgress c
   state <-
     atomically $ do
       writeTVar as ASSuspending
       suspendOperation c AONtfNetwork $ pure ()
       suspendOperation c AORcvNetwork $
-        suspendOperation c AOMsgDelivery $
-          suspendSendingAndDatabase c
+        suspendOperation c AOSndFiles $
+          suspendMsgDelivery c
       readTVar as
   when (state == ASSuspending) . void . forkIO $ do
     threadDelay maxDelay
@@ -3544,6 +3545,7 @@ cleanupManager c@AgentClient {subQ} = do
       sndFilesTTL <- asks $ sndFilesTTL . config
       sndExpired <- withStore' c (`getSndFilesExpired` sndFilesTTL)
       forM_ sndExpired $ \(dbId, entId, p) -> flip catchAllErrors (notify entId . SFERR) $ do
+        atomically $ removeSndFileInProgress c entId
         lift . forM_ p $ removePath <=< toFSFilePath
         withStore' c (`deleteSndFile'` dbId)
     deleteSndFilesDeleted = do

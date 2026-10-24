@@ -156,9 +156,14 @@ module Simplex.Messaging.Agent.Client
     waitUntilForeground,
     waitWhileSuspended,
     suspendSendingAndDatabase,
+    suspendMsgDelivery,
     suspendOperation,
     notifySuspended,
     whenSuspending,
+    addSndFileInProgress,
+    removeSndFileInProgress,
+    removeDeletedOrFailedSndFilesInProgress,
+    waitUntilUploadsAllowed,
     withStore,
     withStore',
     withStoreBatch,
@@ -236,7 +241,7 @@ import Simplex.FileTransfer.Description (ChunkReplicaId (..), FileDigest (..), k
 import Simplex.FileTransfer.Protocol (FileInfo (..), FileResponse)
 import Simplex.FileTransfer.Transport (XFTPErrorType (DIGEST), XFTPRcvChunkSpec (..), XFTPVersion)
 import qualified Simplex.FileTransfer.Transport as XFTP
-import Simplex.FileTransfer.Types (DeletedSndChunkReplica (..), NewSndChunkReplica (..), RcvFileChunkReplica (..), SndFileChunk (..), SndFileChunkReplica (..))
+import Simplex.FileTransfer.Types (DeletedSndChunkReplica (..), NewSndChunkReplica (..), RcvFileChunkReplica (..), SndFileChunk (..), SndFileChunkReplica (..), SndFileId)
 import Simplex.FileTransfer.Util (uniqueCombine)
 import Simplex.Messaging.Agent.Env.SQLite
 import Simplex.Messaging.Agent.Lock
@@ -372,6 +377,8 @@ data AgentClient = AgentClient
     asyncCmdWorkers :: TMap (ConnId, Maybe SMPServer) Worker,
     ntfNetworkOp :: TVar AgentOpState,
     rcvNetworkOp :: TVar AgentOpState,
+    sndFilesOp :: TVar AgentOpState,
+    sndFilesInProgress :: TVar (Set SndFileId),
     msgDeliveryOp :: TVar AgentOpState,
     sndNetworkOp :: TVar AgentOpState,
     databaseOp :: TVar AgentOpState,
@@ -471,19 +478,20 @@ runWorkerAsync Worker {action} work =
   where
     start = atomically . putTMVar action . Just =<< mkWeakThreadId =<< forkIO work
 
-data AgentOperation = AONtfNetwork | AORcvNetwork | AOMsgDelivery | AOSndNetwork | AODatabase
+data AgentOperation = AONtfNetwork | AORcvNetwork | AOSndFiles | AOMsgDelivery | AOSndNetwork | AODatabase
   deriving (Eq, Show)
 
 agentOpSel :: AgentOperation -> (AgentClient -> TVar AgentOpState)
 agentOpSel = \case
   AONtfNetwork -> ntfNetworkOp
   AORcvNetwork -> rcvNetworkOp
+  AOSndFiles -> sndFilesOp
   AOMsgDelivery -> msgDeliveryOp
   AOSndNetwork -> sndNetworkOp
   AODatabase -> databaseOp
 
 agentOperations :: [AgentClient -> TVar AgentOpState]
-agentOperations = [ntfNetworkOp, rcvNetworkOp, msgDeliveryOp, sndNetworkOp, databaseOp]
+agentOperations = [ntfNetworkOp, rcvNetworkOp, sndFilesOp, msgDeliveryOp, sndNetworkOp, databaseOp]
 
 data AgentOpState = AgentOpState {opSuspended :: !Bool, opsInProgress :: !Int}
 
@@ -544,6 +552,8 @@ newAgentClient clientId InitialAgentServers {smp, ntf, xftp, entitlements, netCf
   asyncCmdWorkers <- TM.emptyIO
   ntfNetworkOp <- newTVarIO $ AgentOpState False 0
   rcvNetworkOp <- newTVarIO $ AgentOpState False 0
+  sndFilesOp <- newTVarIO $ AgentOpState False 0
+  sndFilesInProgress <- newTVarIO S.empty
   msgDeliveryOp <- newTVarIO $ AgentOpState False 0
   sndNetworkOp <- newTVarIO $ AgentOpState False 0
   databaseOp <- newTVarIO $ AgentOpState False 0
@@ -588,6 +598,8 @@ newAgentClient clientId InitialAgentServers {smp, ntf, xftp, entitlements, netCf
         asyncCmdWorkers,
         ntfNetworkOp,
         rcvNetworkOp,
+        sndFilesOp,
+        sndFilesInProgress,
         msgDeliveryOp,
         sndNetworkOp,
         databaseOp,
@@ -1014,6 +1026,7 @@ closeAgentClient c = do
   atomically $ SS.clear $ currentSubs c
   clear subscrConns
   clear getMsgLocks
+  atomically $ readTVar (sndFilesInProgress c) >>= mapM_ (removeSndFileInProgress c)
   where
     clearWorkers :: Ord k => (AgentClient -> TMap k a) -> IO (Map k a)
     clearWorkers workers = atomically $ swapTVar (workers c) mempty
@@ -2360,8 +2373,10 @@ endAgentOperation :: AgentClient -> AgentOperation -> STM ()
 endAgentOperation c op = endOperation c op $ case op of
   AONtfNetwork -> pure ()
   AORcvNetwork ->
-    suspendOperation c AOMsgDelivery $
-      suspendSendingAndDatabase c
+    suspendOperation c AOSndFiles $
+      suspendMsgDelivery c
+  AOSndFiles ->
+    suspendMsgDelivery c
   AOMsgDelivery ->
     suspendSendingAndDatabase c
   AOSndNetwork ->
@@ -2369,6 +2384,11 @@ endAgentOperation c op = endOperation c op $ case op of
       notifySuspended c
   AODatabase ->
     notifySuspended c
+
+suspendMsgDelivery :: AgentClient -> STM ()
+suspendMsgDelivery c =
+  suspendOperation c AOMsgDelivery $
+    suspendSendingAndDatabase c
 
 suspendSendingAndDatabase :: AgentClient -> STM ()
 suspendSendingAndDatabase c =
@@ -2400,6 +2420,28 @@ whenSuspending :: AgentClient -> STM () -> STM ()
 whenSuspending c = whenM ((== ASSuspending) <$> readTVar (agentState c))
 {-# INLINE whenSuspending #-}
 
+addSndFileInProgress :: AgentClient -> SndFileId -> STM ()
+addSndFileInProgress c fId = do
+  added <- stateTVar (sndFilesInProgress c) $ \fs -> (S.notMember fId fs, S.insert fId fs)
+  when added $ modifyTVar' (sndFilesOp c) $ \s -> s {opsInProgress = opsInProgress s + 1}
+
+removeSndFileInProgress :: AgentClient -> SndFileId -> STM ()
+removeSndFileInProgress c fId = do
+  removed <- stateTVar (sndFilesInProgress c) $ \fs -> (S.member fId fs, S.delete fId fs)
+  when removed $ endAgentOperation c AOSndFiles
+
+removeDeletedOrFailedSndFilesInProgress :: AgentClient -> IO ()
+removeDeletedOrFailedSndFilesInProgress c = do
+  fIds <- readTVarIO $ sndFilesInProgress c
+  unless (S.null fIds) $
+    E.bracket (atomically $ tryBeginAgentOperation c AODatabase) endDatabaseOperation $ \begun ->
+      when begun $
+        E.tryAny (withTransaction (agentClientStore c) getNotDeletedOrFailedSndFileIds) >>= \case
+          Right fIds' -> atomically $ mapM_ (removeSndFileInProgress c) $ fIds `S.difference` S.fromList fIds'
+          Left e -> logError $ "removeDeletedOrFailedSndFilesInProgress error: " <> tshow e
+  where
+    endDatabaseOperation begun = when begun $ atomically $ endAgentOperation c AODatabase
+
 beginAgentOperation :: AgentClient -> AgentOperation -> STM ()
 beginAgentOperation c op = do
   let opVar = agentOpSel op c
@@ -2408,6 +2450,9 @@ beginAgentOperation c op = do
   when (opSuspended s) retry
   -- unsafeIOToSTM $ putStrLn $ "beginOperation! " <> show op <> " " <> show (opsInProgress s + 1)
   writeTVar opVar $! s {opsInProgress = opsInProgress s + 1}
+
+tryBeginAgentOperation :: AgentClient -> AgentOperation -> STM Bool
+tryBeginAgentOperation c op = (True <$ beginAgentOperation c op) `orElse` pure False
 
 agentOperationBracket :: MonadUnliftIO m => AgentClient -> AgentOperation -> (AgentClient -> IO ()) -> m a -> m a
 agentOperationBracket c op check action =
@@ -2431,6 +2476,18 @@ waitWhileSuspended c =
   where
     suspended :: Monad m => (TVar AgentState -> m AgentState) -> m Bool
     suspended rd = (ASSuspended ==) <$> rd (agentState c)
+
+waitUntilUploadsAllowed :: AgentClient -> IO ()
+waitUntilUploadsAllowed c = atomically $ unlessM uploadsAllowed retry
+  where
+    uploadsAllowed =
+      readTVar (agentState c) >>= \case
+        ASForeground -> pure True
+        ASSuspending -> do
+          AgentOpState {opsInProgress} <- readTVar $ sndFilesOp c
+          AgentOpState {opSuspended} <- readTVar $ sndNetworkOp c
+          pure $ opsInProgress > 0 && not opSuspended
+        ASSuspended -> pure False
 
 withStore' :: AgentClient -> (DB.Connection -> IO a) -> AM a
 withStore' c action = withStore c $ fmap Right . action
