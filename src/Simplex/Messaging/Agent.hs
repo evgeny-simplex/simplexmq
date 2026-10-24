@@ -3439,6 +3439,7 @@ suspendAgent c 0 = do
   where
     suspend opSel = atomically $ modifyTVar' (opSel c) $ \s -> s {opSuspended = True}
 suspendAgent c@AgentClient {agentState = as} maxDelay = do
+  removeEndedSndFilesInProgress c
   state <-
     atomically $ do
       writeTVar as ASSuspending

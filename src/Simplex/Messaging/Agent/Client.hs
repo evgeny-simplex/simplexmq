@@ -162,6 +162,7 @@ module Simplex.Messaging.Agent.Client
     whenSuspending,
     addSndFileInProgress,
     removeSndFileInProgress,
+    removeEndedSndFilesInProgress,
     waitWhileSndFilesSuspended,
     withStore,
     withStore',
@@ -1025,6 +1026,7 @@ closeAgentClient c = do
   atomically $ SS.clear $ currentSubs c
   clear subscrConns
   clear getMsgLocks
+  atomically $ readTVar (sndFilesInProgress c) >>= mapM_ (removeSndFileInProgress c)
   where
     clearWorkers :: Ord k => (AgentClient -> TMap k a) -> IO (Map k a)
     clearWorkers workers = atomically $ swapTVar (workers c) mempty
@@ -2428,6 +2430,18 @@ removeSndFileInProgress c fId = do
   removed <- stateTVar (sndFilesInProgress c) $ \fs -> (S.member fId fs, S.delete fId fs)
   when removed $ endAgentOperation c AOSndFiles
 
+removeEndedSndFilesInProgress :: AgentClient -> IO ()
+removeEndedSndFilesInProgress c = do
+  fIds <- readTVarIO $ sndFilesInProgress c
+  unless (S.null fIds) $
+    E.bracket (atomically $ tryBeginAgentOperation c AODatabase) endDatabaseOperation $ \begun ->
+      when begun $
+        E.tryAny (withTransaction (agentClientStore c) getActiveSndFileIds) >>= \case
+          Right activeIds -> atomically $ mapM_ (removeSndFileInProgress c) $ fIds `S.difference` S.fromList activeIds
+          Left e -> logError $ "removeEndedSndFilesInProgress error: " <> tshow e
+  where
+    endDatabaseOperation begun = when begun $ atomically $ endAgentOperation c AODatabase
+
 beginAgentOperation :: AgentClient -> AgentOperation -> STM ()
 beginAgentOperation c op = do
   let opVar = agentOpSel op c
@@ -2436,6 +2450,12 @@ beginAgentOperation c op = do
   when (opSuspended s) retry
   -- unsafeIOToSTM $ putStrLn $ "beginOperation! " <> show op <> " " <> show (opsInProgress s + 1)
   writeTVar opVar $! s {opsInProgress = opsInProgress s + 1}
+
+tryBeginAgentOperation :: AgentClient -> AgentOperation -> STM Bool
+tryBeginAgentOperation c op = do
+  suspended <- opSuspended <$> readTVar (agentOpSel op c)
+  unless suspended $ beginAgentOperation c op
+  pure $ not suspended
 
 agentOperationBracket :: MonadUnliftIO m => AgentClient -> AgentOperation -> (AgentClient -> IO ()) -> m a -> m a
 agentOperationBracket c op check action =
