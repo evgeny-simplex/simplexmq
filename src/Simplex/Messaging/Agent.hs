@@ -1723,6 +1723,7 @@ allowConnection' :: AgentClient -> Maybe AsyncCmdId -> ConnId -> ConfirmationId 
 allowConnection' c cmdId_ connId confId ownConnInfo = withConnLock c connId "allowConnection" $ do
   withStore c (`getConn` connId) >>= \case
     SomeConn _ (RcvConnection _ RcvQueue {server, rcvId}) -> do
+      conEvent connId ("allow rcv conf=" <> show confId <> " cmd=" <> show cmdId_)
       withStore c $ \db -> runExceptT $ do
         AcceptedConfirmation {senderConf = SMPConfirmation {senderKey}} <- ExceptT $ acceptConfirmation db confId ownConnInfo
         ExceptT $ createCommand db "" connId (Just server) $ AInternalCommand $ ICAllowSecure rcvId senderKey
@@ -2208,6 +2209,7 @@ sendMessagesB_ c reqs connIds = withConnLocks c connIds "sendMessages" $ do
 
 enqueueCommand :: AgentClient -> ACorrId -> ConnId -> Maybe SMPServer -> AgentCommand -> AM ()
 enqueueCommand c corrId connId server aCommand = do
+  conEvent connId ("enqueue " <> show (agentCommandTag aCommand) <> " srv=" <> show server)
   withStore c $ \db -> createCommand db corrId connId server aCommand
   lift . void $ getAsyncCmdWorker True c connId server
 
@@ -2242,7 +2244,8 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
     atomically $ beginAgentOperation c AOSndNetwork
     withWork c doWork (\db -> getPendingServerCommand db connId server_) $ runProcessCmd ri
   where
-    runProcessCmd ri cmd = do
+    runProcessCmd ri cmd@PendingCommand {cmdId = pcId, command = pcCommand} = do
+      conEvent connId ("process " <> show (agentCommandTag pcCommand) <> " cmd=" <> show pcId <> " srv=" <> show server_)
       pending <- newTVarIO []
       processCmd ri cmd pending
       mapM_ (atomically . writeTBQueue subQ) . reverse =<< readTVarIO pending
@@ -2319,10 +2322,12 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
                 Nothing -> pure CCCompleted
           case conn of
             RcvConnection cData rq -> do
+              conEvent connId ("allow-secure rcv cmd=" <> show cmdId)
               mapM_ (secure rq) senderKey
               connectReplyQueues_ cData Nothing
             -- duplex connection is matched to handle SKEY retries
             DuplexConnection cData _ (sq :| _) -> do
+              conEvent connId ("allow-secure duplex cmd=" <> show cmdId)
               tryAllErrors (connectReplyQueues_ cData (Just sq)) >>= \case
                 Right cc -> pure cc
                 Left e
@@ -3495,6 +3500,7 @@ conDebugSites = unsafePerformIO $ newTVarIO M.empty
 
 conDebug :: MonadIO m => String -> ConnId -> m ()
 conDebug site connId = liftIO $ do
+  conEvent connId ("CON " <> site)
   tid <- myThreadId
   ts <- getCurrentTime
   let entry = site <> " " <> show tid <> " " <> show ts
@@ -3502,7 +3508,19 @@ conDebug site connId = liftIO $ do
     m <- readTVar conDebugSites
     writeTVar conDebugSites $ M.insert connId entry m
     pure $ M.lookup connId m
-  forM_ prev $ \p -> hPutStrLn stderr $ "DUP-CON " <> show connId <> " first: " <> p <> " second: " <> entry
+  forM_ prev $ \p -> do
+    events <- M.findWithDefault [] connId <$> readTVarIO conDebugEvents
+    hPutStrLn stderr $ "DUP-CON " <> show connId <> " first: " <> p <> " second: " <> entry <> " events: " <> show events
+
+conDebugEvents :: TVar (Map ConnId [String])
+conDebugEvents = unsafePerformIO $ newTVarIO M.empty
+{-# NOINLINE conDebugEvents #-}
+
+conEvent :: MonadIO m => ConnId -> String -> m ()
+conEvent connId label = liftIO $ do
+  tid <- myThreadId
+  ts <- getCurrentTime
+  atomically $ modifyTVar' conDebugEvents $ M.insertWith (flip (<>)) connId [label <> " " <> show tid <> " " <> show ts]
 
 maxRatchetKeyHashes :: Int
 maxRatchetKeyHashes = 100
@@ -4014,6 +4032,7 @@ processSMPTransmissions c@AgentClient {subQ} (tSess@(userId, srv, _), THandlePar
                             -- /
                             createConfirmation db g newConfirmation
                           let srvs = map qServer $ smpReplyQueues senderConf
+                          conEvent connId ("conf conf=" <> show confId <> " srvMsg=" <> show srvMsgId <> " status=" <> show status)
                           notify $ CONF confId pqSupport' srvs connInfo
                 -- party accepting connection
                 DuplexConnection _ (rq'@RcvQueue {smpClientVersion = v'} :| _) _ | isNothing e2eEncryption -> do
@@ -4478,6 +4497,7 @@ storeConfirmation c cmdId_ cData@ConnData {connId, pqSupport, connAgentVersion =
     liftIO $ createSndMsg db connId msgData
     liftIO $ createSndMsgDelivery db sq internalId
     liftIO $ mapM_ (deleteCommand db) cmdId_
+    conEvent connId ("store-conf " <> show msgType <> " cmd=" <> show cmdId_ <> " msg=" <> show internalId)
 
 enqueueRatchetKeyMsgs :: AgentClient -> ConnData -> NonEmpty SndQueue -> InternalId -> AM' ()
 enqueueRatchetKeyMsgs c cData (sq :| sqs) (InternalId msgId) = do
