@@ -98,11 +98,13 @@ xftpAgentTests =
       it "should wait for complete file until it is deleted while agent is suspending" testXFTPAgentSuspendCompleteFile
       it "should not wait for file deleted from database while agent is suspending" $ \_ ->
         testXFTPAgentSuspendAfter $ \sndr -> withTransaction (agentClientStore sndr) (`DB.execute_` "DELETE FROM snd_files")
+      it "should not wait for file marked deleted while agent is suspending" $ \_ ->
+        testXFTPAgentSuspendAfter $ \sndr -> withTransaction (agentClientStore sndr) (`DB.execute_` "UPDATE snd_files SET deleted = 1")
       it "should not wait for file marked failed while agent is suspending" $ \_ ->
         testXFTPAgentSuspendAfter $ \sndr -> withTransaction (agentClientStore sndr) (`DB.execute_` "UPDATE snd_files SET failed = 1")
       it "should not wait for file after agent client is closed" $ \_ ->
         testXFTPAgentSuspendAfter $ \sndr -> XA.disconnectAgentClient sndr >> XA.resumeAgentClient sndr
-      it "should not block suspending while database is suspended" $ \_ -> testXFTPAgentSuspendDatabaseSuspended
+      it "should not access database when suspending while database is suspended" $ \_ -> testXFTPAgentSuspendDatabaseSuspended
       describe "XFTP server test via agent API" $ do
         it "should pass without basic auth" $ \_ -> testXFTPServerTest Nothing (noAuthSrv testXFTPServer2) `shouldReturn` Right (Just (Right testServerInformation))
         let srv1 :: HasTestEnv => XFTPServer
@@ -718,7 +720,8 @@ testXFTPAgentSuspendDatabaseSuspended = withGlobalLogging logCfgNoLogs $ do
       xftpStartWorkers sndr (Just senderFiles)
       void $ xftpSendFile sndr 1 (CF.plain filePath) 1
     XA.suspendAgent sndr 0
-    timeout 5000000 (XA.suspendAgent sndr 60000000) `shouldReturn` Just ()
+    withTransaction (agentClientStore sndr) $ \_ ->
+      timeout 5000000 (XA.suspendAgent sndr 60000000) `shouldReturn` Just ()
 
 waitSndFileDone :: AgentClient -> SndFileId -> IO ()
 waitSndFileDone sndr sfId =
