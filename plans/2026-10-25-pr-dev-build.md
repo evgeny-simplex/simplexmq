@@ -21,15 +21,15 @@ reduced run
     workflow_dispatch on a branch (agents: fork branch ep/<topic>)
     pull_request on a draft (any type of change 1)
   jobs
-    maybe-release (matrix choice, change 2)
+    maybe-release (output reduced, change 2)
     resolver (python) (Q4)
-    ubuntu-24.04-x86-64, GHC: 9.6.3
+    build-reduced: ubuntu-24.04-x86-64, GHC: 9.6.3 (change 5)
   targets
     dist-postgres at -O0: every component of the package (build.yml:253)
     dist-newstyle: skipped (change 6, Q5)
   tests
     the selection (Test selection)
-    empty selection: full suite
+    no pattern: none
     1 attempt (build.yml:399)
 
 full run
@@ -41,7 +41,7 @@ full run
   jobs
     maybe-release
     resolver (python)
-    the five entries of build.yml:99-129 (reproduced by change 2)
+    build: the five entries of build.yml:99-129
   targets
     dist-postgres (build.yml:253)
     dist-newstyle (build.yml:297)
@@ -86,7 +86,8 @@ Syntax:
 - Group names are the `describe` names in tests/Test.hs:86-196. Every group whose path contains a pattern is selected. Example: with `SMP client agent, server memory message store`, the parallel group (330 items) and the sequential group (4 items) are selected (log 40208423064, 22.04 x86-64 9.6.3).
 
 Default:
-- With an empty input or an absent block, the full suite runs.
+- `/` selects the whole suite: every item path contains `/`.
+- With no pattern, a reduced run builds without tests and its Test step prints "No tests selected" (change 7).
 - The selection is ignored on full runs: `TESTS` is empty outside workflow_dispatch, and `PR_BODY` is empty unless the pull request is a draft (change 7).
 
 ## Warm cache
@@ -127,41 +128,26 @@ Eviction: entries unused for 7 days are removed; above the size limit, entries a
      workflow_dispatch:
        inputs:
          tests:
-           description: "hspec match patterns, one per line; empty runs all tests"
+           description: "hspec match patterns, one per line; / runs all tests, empty runs none"
            type: string
            default: ""
    ```
    The default pull_request types are opened, synchronize and reopened (events page).
 
-2. Matrix choice (Q2). Lines 25-27 become the lines below; line 28 (`- name: Clone project`) and the release steps follow unchanged.
+2. Reduced output and tag guard. Lines 25-27 become the lines below; line 28 (`- name: Clone project`) and the release steps follow unchanged.
    ```yaml
      maybe-release:
        runs-on: ubuntu-latest
        outputs:
-         matrix: ${{ steps.plan.outputs.matrix }}
-         reduced: ${{ steps.plan.outputs.reduced }}
+         reduced: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == true }}
        steps:
-         - name: Choose build matrix
-           id: plan
-           shell: bash
-           env:
-             REDUCED: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == true }}
-             GHC8: ${{ !(github.ref == 'refs/heads/stable' || startsWith(github.ref, 'refs/tags/v')) }}
+         - name: Reject a manual run on a tag
+           if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'
            run: |
-             ghc8='{"os":"22.04","os_underscore":"22_04","arch":"x86-64","runner":"ubuntu-22.04","ghc":"8.10.7","should_run":'"$GHC8"'}'
-             x86_2204='{"os":"22.04","os_underscore":"22_04","arch":"x86-64","runner":"ubuntu-22.04","ghc":"9.6.3","should_run":true}'
-             x86_2404='{"os":"24.04","os_underscore":"24_04","arch":"x86-64","runner":"ubuntu-24.04","ghc":"9.6.3","should_run":true}'
-             arm_2204='{"os":"22.04","os_underscore":"22_04","arch":"aarch64","runner":"ubuntu-22.04-arm","ghc":"9.6.3","should_run":true}'
-             arm_2404='{"os":"24.04","os_underscore":"24_04","arch":"aarch64","runner":"ubuntu-24.04-arm","ghc":"9.6.3","should_run":true}'
-             if [ "$REDUCED" = true ]; then
-               entries=$x86_2404
-             else
-               entries=$ghc8,$x86_2204,$x86_2404,$arm_2204,$arm_2404
-             fi
-             echo "matrix={\"include\":[$entries]}" >> "$GITHUB_OUTPUT"
-             echo "reduced=$REDUCED" >> "$GITHUB_OUTPUT"
+             echo "::error::A manual run starts on a branch; to retry a release, re-run the jobs of its tag push."
+             exit 1
    ```
-   The five entries reproduce lines 100-129 in the same order. `GHC8` is the expression of line 105.
+   A re-run of a tag-push run keeps its event, `push` (re-runs 40172782505, 40078644261 and 40078171679, attempt 2, kept event `pull_request`), so the guard applies only to new manual runs.
 
 3. Optimisation level. Lines 74-75 become:
    ```yaml
@@ -176,11 +162,30 @@ Eviction: entries unused for 7 days are removed; above the size limit, entries a
    ```
    In the main repository the value is unchanged (`simplex-chat`).
 
-5. Matrix source (Q2). Lines 98-129 become:
+5. Reduced job (Q2). The build job gets `if: needs.maybe-release.outputs.reduced != 'true'` after `needs` (line 68), and anchors on its `env` (line 72), `services` (line 83) and `steps` (line 130): `env: &build-env`, `services: &build-services`, `steps: &build-steps`. Its matrix (lines 99-129) is unchanged. A new job follows it:
    ```yaml
-         matrix: ${{ fromJSON(needs.maybe-release.outputs.matrix) }}
+     build-reduced:
+       name: "ubuntu-${{ matrix.os }}-${{ matrix.arch }}, GHC: ${{ matrix.ghc }}"
+       needs: maybe-release
+       if: needs.maybe-release.outputs.reduced == 'true'
+       permissions:
+         contents: write
+         packages: write
+       env: *build-env
+       runs-on: ${{ matrix.runner }}
+       services: *build-services
+       strategy:
+         matrix:
+           include:
+             - os: 24.04
+               os_underscore: 24_04
+               arch: x86-64
+               runner: "ubuntu-24.04"
+               ghc: "9.6.3"
+               should_run: true
+       steps: *build-steps
    ```
-   The build job already depends on maybe-release (line 68). The `needs` context is available in `jobs.<job_id>.strategy` (contexts page). In the `fromJSON` example of https://docs.github.com/en/actions/reference/workflows-and-actions/expressions, a whole matrix is set from a job output of the form `{"include":[...]}`. With only `include` in a matrix, one job runs per entry (https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+   On a reduced run, build is skipped without starting a runner, and build-reduced runs the shared steps for the one entry.
 
 6. Standard build on reduced runs (Q5). Line 294 becomes:
    ```yaml
@@ -192,6 +197,7 @@ Eviction: entries unused for 7 days are removed; above the size limit, entries a
    ```yaml
            env:
              PGHOST: localhost
+             REDUCED: ${{ needs.maybe-release.outputs.reduced }}
              TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.tests || '' }}
              PR_BODY: ${{ github.event.pull_request.draft == true && github.event.pull_request.body || '' }}
            run: |
@@ -202,7 +208,12 @@ Eviction: entries unused for 7 days are removed; above the size limit, entries a
              while read -r p; do
                if [ -n "$p" ]; then args+=(-m "$p"); fi
              done <<< "$TESTS"
-             if [ "${#args[@]}" -gt 0 ]; then args+=(--fail-on=empty); fi
+             if [ "${#args[@]}" -gt 0 ]; then
+               args+=(--fail-on=empty)
+             elif [ "$REDUCED" = true ]; then
+               echo "No tests selected"
+               exit 0
+             fi
              i=1
              attempts=1
              ${{ (github.ref == 'refs/heads/stable' || startsWith(github.ref, 'refs/tags/v')) }} && attempts=3
@@ -263,12 +274,13 @@ Other:
 The change is proposed as a draft pull request in simplex-chat/simplexmq from a fork branch. Its description contains a `ci-tests` block with `/Core tests/Encoding tests/`.
 
 1. Draft run.
-   - Pass: the run lists three jobs.
+   - Pass: three jobs run, and build is skipped.
      - maybe-release
      - resolver (python)
-     - ubuntu-24.04-x86-64, GHC: 9.6.3
+     - build-reduced: ubuntu-24.04-x86-64, GHC: 9.6.3
    - Pass: "Build everything else (standard)" is skipped.
    - Pass: the Test log reports "16 examples, 0 failures" (16 items under `/Core tests/Encoding tests/` in 40208423064, 24.04 x86-64).
+   - Pass: with the block removed from the description, the next push builds and the Test step prints "No tests selected".
    - Pass: "Restore build directories from cache" logs `Cache restored from key: dist-24.04-x86-64-ghc9.6.3-`.
    - Pass: job time minus the Test step is at most 304 s when both restores hit.
    - Pass after a deps miss: the Build step takes at most 668 s.
@@ -303,14 +315,10 @@ Q1. Source of the test selection on a draft pull request (visible to the reviewe
 - D. Full suite on every draft run. Cost: about 11 minutes of Test step per push (666 s median); agents cannot select tests on drafts.
 - Recommendation: A. With B, merge-time cleanup is needed; with C, a fetch. With D, the expectation is unmet.
 
-Q2. Matrix mechanism for one job.
-- A. maybe-release outputs the matrix as JSON (changes 2 and 5). Cost: the five entries move from YAML to JSON strings in a shell step.
-- B. Keep the YAML list and set `should_run` false on four entries for reduced runs. Cost: four more jobs per reduced run, 27-33 s each with "Initialize containers" (Measurements).
-- C. An os, arch and ghc axis matrix with an `exclude` expression. Cost: `runs-on` and `os_underscore` (build.yml:82, :277, :316) become expressions, because `include` is processed after `exclude` and an `include` entry for an excluded combination becomes a new job (workflow-syntax page); 8.10.7 is excluded on stable and tags, where today its steps are skipped.
-- Recommendation: A. With B, the run has five build jobs. With C, three more lines are rewritten and stable and tag runs change.
+Q2. Matrix mechanism for one job. Decided by the user: YAML job conditions (change 5), in place of a matrix produced as JSON by a shell step.
 
 Q3. aarch64 test time. Tests are off on aarch64 since b020a08ea0 (2025-09-15, "ci: disable aarch64 tests (#1638)"); the commit message is the title only.
-- A. One experiment: a throwaway fork branch where the plan step sets `entries=$arm_2404` for reduced runs and the `matrix.arch == 'x86-64'` conditions at build.yml:376, :384, :392 are removed; three dispatches with empty `tests`. The image of that runner includes PostgreSQL 16.15 (log 40208423064 24.04 aarch64:17-19 names image 20261012.149.1; https://github.com/actions/runner-images/blob/ubuntu24-arm64/20261012.149/images/ubuntu/Ubuntu2404-Arm64-Readme.md). Cost: three runs of about 16 minutes (INFERENCE: 285 s job median plus the 666 s x86-64 Test median); the branch is deleted afterwards.
+- A. One experiment: a throwaway fork branch where the build-reduced entry is set to `arch: aarch64` and `runner: "ubuntu-24.04-arm"` and the `matrix.arch == 'x86-64'` conditions at build.yml:376, :384, :392 are removed; three dispatches with empty `tests`. The image of that runner includes PostgreSQL 16.15 (log 40208423064 24.04 aarch64:17-19 names image 20261012.149.1; https://github.com/actions/runner-images/blob/ubuntu24-arm64/20261012.149/images/ubuntu/Ubuntu2404-Arm64-Readme.md). Cost: three runs of about 16 minutes (INFERENCE: 285 s job median plus the 666 s x86-64 Test median); the branch is deleted afterwards.
 - B. A permanent dispatch input for the architecture. Cost: a permanent input plus matrix logic for a one-time comparison.
 - C. No experiment. Cost: arm64 test time stays unmeasured.
 - Recommendation: A. If all three runs pass every test with a Test step median below 666 s, the reduced entry is switched to `arm_2404`, with its Test step enabled, in a follow-up change.
@@ -328,5 +336,5 @@ Q5. Standard build on reduced runs (change 6).
 
 Q6. Fork master push builds (the seeds of fork dispatches).
 - A. Full matrix, as today. Cost: five jobs per sync of the fork's master; the 8.10.7 job takes 42 minutes (Measurements).
-- B. One entry in forks: the plan step sets `entries=$x86_2404` also when `github.repository != 'simplex-chat/simplexmq'`, and `reduced` keeps the expression of change 2, so the standard build and the -O0 reseed (build.yml:415-459) run. Cost: one env line and one condition term in the plan step.
+- B. One entry in forks: on a push outside simplex-chat/simplexmq, build-reduced runs and build is skipped (a `github.repository` term in both job conditions); `reduced` keeps the expression of change 2, so the standard build and the -O0 reseed (build.yml:415-459) run. Cost: one condition term in each of the two jobs.
 - Recommendation: B. With A, each sync adds four jobs, while fork dispatches read only the 24.04 x86-64 entries.
