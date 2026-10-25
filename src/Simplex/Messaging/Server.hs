@@ -1148,6 +1148,7 @@ receive h@THandle {params = THandleParams {thAuth, sessionId}} ms c@Client {rcvQ
   sa <- asks serverActive
   stats <- asks serverStats
   authDelay <- asks $ authErrorDelay . config
+  maxDelayed <- asks $ fromIntegral . tbqSize . config
   liftIO $ forever $ do
     ts <- tGetServer h
     unlessM (readTVarIO sa) $ throwIO $ userError "server stopped"
@@ -1168,7 +1169,7 @@ receive h@THandle {params = THandleParams {thAuth, sessionId}} ms c@Client {rcvQ
         mapM_ (atomically . writeTBQueue rcvQ) $ L.nonEmpty cmds
         pure $ errs ++ errs'
       [] -> pure errs
-    mapM_ (sendResponses c stats authDelay receivedAt . (,[])) $ L.nonEmpty errs'
+    mapM_ (sendResponses c stats authDelay maxDelayed receivedAt . (,[])) $ L.nonEmpty errs'
   where
     sameParty :: SParty p -> SignedTransmission Cmd -> Bool
     sameParty p (_, _, (_, _, Cmd p' _)) = isJust $ testEquality p p'
@@ -1196,17 +1197,21 @@ isAuthError (_, _, r) = case r of
   ERR AUTH -> True
   _ -> False
 
-sendResponses :: Client s -> ServerStats -> Int64 -> SystemTime -> (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]) -> IO ()
-sendResponses c@Client {sndQ} stats authDelay since rs@(ts, _)
-  | any isAuthError ts = sendAfterDelay c stats authDelay since rs
+sendResponses :: Client s -> ServerStats -> Int64 -> Int -> SystemTime -> (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]) -> IO ()
+sendResponses c@Client {sndQ} stats authDelay maxDelayed since rs@(ts, _)
+  | any isAuthError ts = sendAfterDelay c stats authDelay maxDelayed since rs
   | otherwise = atomically $ writeTBQueue sndQ rs
 
-sendAfterDelay :: Client s -> ServerStats -> Int64 -> SystemTime -> (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]) -> IO ()
-sendAfterDelay c@Client {sndQ, clientTHParams = THandleParams {sessionId}} stats delay since rs
+sendAfterDelay :: Client s -> ServerStats -> Int64 -> Int -> SystemTime -> (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]) -> IO ()
+sendAfterDelay c@Client {sndQ, delayedResponses, clientTHParams = THandleParams {sessionId}} stats delay maxDelayed since rs
   | delay > 0 = do
+      atomically $ do
+        delayed <- readTVar delayedResponses
+        when (delayed >= maxDelayed) retry
+        writeTVar delayedResponses $! delayed + 1
       elapsed <- subtract (microseconds since) . microseconds <$> getSystemTime
       when (elapsed >= delay) $ incStat $ authDelayExceeded stats
-      forkClient c (B.unpack $ "client $" <> encode sessionId <> " auth") $ threadDelay' (delay - elapsed `mod` delay) >> write
+      forkClient c (B.unpack $ "client $" <> encode sessionId <> " auth") $ (threadDelay' (delay - elapsed `mod` delay) >> write) `finally` atomically (modifyTVar' delayedResponses (subtract 1))
   | otherwise = write
   where
     write = atomically $ writeTBQueue sndQ rs
@@ -1413,6 +1418,7 @@ client
     labelMyThread . B.unpack $ "client $" <> encode sessionId <> " commands"
     stats <- asks serverStats
     authDelay <- asks $ authErrorDelay . config
+    maxDelayed <- asks $ fromIntegral . tbqSize . config
     let clntServiceId = (\THClientService {serviceId} -> serviceId) <$> (peerClientService =<< thAuth thParams')
         process batchSubs t acc@(rs, msgs) =
           (maybe acc (\(!r, !msg_) -> (r : rs, maybe msgs (: msgs) msg_)))
@@ -1422,7 +1428,7 @@ client
       processedAt <- liftIO getSystemTime
       batchSubs <- prepareBatchSubs clntServiceId batch
       foldrM (process batchSubs) ([], []) batch
-        >>= \(rs_, msgs) -> mapM_ (liftIO . sendResponses clnt stats authDelay processedAt . (,msgs)) (L.nonEmpty rs_)
+        >>= \(rs_, msgs) -> mapM_ (liftIO . sendResponses clnt stats authDelay maxDelayed processedAt . (,msgs)) (L.nonEmpty rs_)
   where
     prepareBatchSubs ::
       Maybe ServiceId ->
@@ -2235,7 +2241,8 @@ client
           traverse encodeResp r_ >>= \case
             Just rres | any isAuthError r_ -> do
               authDelay <- asks $ authErrorDelay . config
-              Nothing <$ liftIO (sendAfterDelay clnt stats authDelay startedAt ([(corrId, NoEntity, rres)], []))
+              maxDelayed <- asks $ serverResolverConcurrency . config
+              Nothing <$ liftIO (sendAfterDelay clnt stats authDelay maxDelayed startedAt ([(corrId, NoEntity, rres)], []))
             rres_ -> pure rres_
           where
             rejectOrVerify :: Maybe (THandleAuth 'TServer) -> SignedTransmissionOrError ErrorType Cmd -> M s (VerifiedTransmissionOrError s)

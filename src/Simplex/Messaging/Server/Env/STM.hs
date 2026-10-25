@@ -192,7 +192,7 @@ data ServerConfig s = ServerConfig
     smpAgentCfg :: SMPClientAgentConfig,
     allowSMPProxy :: Bool, -- auth is the same with `newQueueBasicAuth`
     serverClientConcurrency :: Int,
-    -- | max concurrent forwarded name resolutions per proxy connection, enforced in forkCmd.
+    -- | max concurrent forwarded name resolutions and delayed AUTH errors per proxy connection, enforced in forkCmd and sendAfterDelay.
     -- Much higher than serverClientConcurrency: forwarded RSLVs from many clients
     -- aggregate over a single proxy->relay connection (only servers send proxied
     -- requests), so bounding them by the per-client limit would throttle unduly.
@@ -433,6 +433,7 @@ data Client s = Client
     sndQ :: TBQueue (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]),
     msgQ :: TBQueue (NonEmpty (Transmission BrokerMsg)),
     procThreads :: TVar Int,
+    delayedResponses :: TVar Int,
     endThreads :: TVar (IntMap (Weak ThreadId)),
     endThreadSeq :: TVar Int,
     clientTHParams :: THandleParams SMPVersion 'TServer,
@@ -506,6 +507,7 @@ newClient clientId qSize clientTHParams createdAt = do
   sndQ <- newTBQueueIO qSize
   msgQ <- newTBQueueIO qSize
   procThreads <- newTVarIO 0
+  delayedResponses <- newTVarIO 0
   endThreads <- newTVarIO IM.empty
   endThreadSeq <- newTVarIO 0
   connected <- newTVarIO True
@@ -524,6 +526,7 @@ newClient clientId qSize clientTHParams createdAt = do
         sndQ,
         msgQ,
         procThreads,
+        delayedResponses,
         endThreads,
         endThreadSeq,
         clientTHParams,

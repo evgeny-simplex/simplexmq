@@ -75,6 +75,8 @@ smpProxyTests = do
       testFwdCorrIdSize
     it "relay delays AUTH errors to forwarded commands" $ \_ ->
       testForwardedAuthErrorDelay
+    it "relay limits pending delayed AUTH errors to forwarded commands" $ \_ ->
+      testForwardedAuthErrorLimit
   describe "deliver message via SMP proxy" $ do
     let srv1, srv2 :: HasTestEnv => SMPServer
         srv1 = SMPServer testHost testPort testKeyHash
@@ -509,6 +511,18 @@ testForwardedAuthErrorDelay =
       (getLinkTime, Left (PCEProtocolError SMP.AUTH)) <- responseTime $ runExceptT $ proxyGetSMPQueueLink pc NRMInteractive sess (SMP.EntityId "1234")
       sendTime `shouldSatisfy` (>= 0.5)
       getLinkTime `shouldSatisfy` (>= 0.5)
+
+testForwardedAuthErrorLimit :: HasTestEnv => IO ()
+testForwardedAuthErrorLimit =
+  withSmpServerConfigOn (transport @TLS) (updateCfg proxyCfg $ \cfg_ -> cfg_ {serverClientConcurrency = 3}) testPort $ \_ ->
+    withSmpServerConfigOn (transport @TLS) (updateCfg cfgS2 $ \cfg_ -> cfg_ {authErrorDelay = 500000, serverResolverConcurrency = 1}) testPort2 $ \_ -> do
+      g <- C.newRandom
+      ts <- getCurrentTime
+      pc <- either (fail . show) pure =<< getProtocolClient g NRMInteractive (1, testSMPServer, Nothing) defaultSMPClientConfig [] Nothing ts (\_ -> pure ())
+      sess <- runExceptT' $ connectSMPProxiedRelay pc NRMInteractive testSMPServer2 Nothing
+      (time, rs) <- responseTime $ replicateConcurrently 3 $ runExceptT $ proxySMPMessage pc NRMInteractive sess Nothing (SMP.EntityId "1234") noMsgFlags "hello"
+      rs `shouldBe` replicate 3 (Left (PCEProtocolError SMP.AUTH))
+      time `shouldSatisfy` (>= 1)
 
 -- Shared "phase 2" of the reconnection tests: start a healthy relay, confirm it is reachable
 -- directly (PING, not via the proxy) so a proxy failure can only mean the proxy didn't reconnect,

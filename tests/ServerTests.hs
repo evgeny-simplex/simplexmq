@@ -1340,7 +1340,7 @@ testTiming =
           ok `shouldBe` True
 
 testAuthErrorDelay :: SpecWith (ASrvTransport, AStoreType)
-testAuthErrorDelay =
+testAuthErrorDelay = do
   it "should send AUTH errors after the delay and other responses without it" $ \(ATransport t, msType) ->
     smpTest2Cfg (updateCfg (cfgMS msType) $ \cfg' -> cfg' {authErrorDelay = 500000}) supportedClientSMPRelayVRange t $ \rh sh -> do
       g <- C.newRandom
@@ -1359,6 +1359,24 @@ testAuthErrorDelay =
       suspendedTime `shouldSatisfy` (>= 0.5)
       noLinkTime `shouldSatisfy` (>= 0.5)
       subTime `shouldSatisfy` (< 0.5)
+  it "should limit pending delayed AUTH errors of failed verification to the client queue size" $ \(ATransport t, msType) ->
+    smpTest2Cfg (updateCfg (cfgMS msType) $ \cfg' -> cfg' {authErrorDelay = 500000, tbqSize = 1}) supportedClientSMPRelayVRange t $ \h _ -> do
+      g <- C.newRandom
+      (_, badKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+      (time, [Resp "1" _ (ERR AUTH), Resp "2" _ (ERR AUTH), Resp "3" _ (ERR AUTH)]) <- responseTime $ do
+        forM_ (["1", "2", "3"] :: [ByteString]) $ \corrId -> signSend_ h badKey Nothing (corrId, EntityId "1234", SUB)
+        replicateM 3 $ tGet1 h
+      time `shouldSatisfy` (>= 1)
+  it "should limit pending delayed AUTH errors of commands to the client queue size" $ \(ATransport t, msType) ->
+    smpTest2Cfg (updateCfg (cfgMS msType) $ \cfg' -> cfg' {authErrorDelay = 500000, tbqSize = 1}) supportedClientSMPRelayVRange t $ \rh sh -> do
+      g <- C.newRandom
+      (sPub, sKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+      (sId, rId, rKey, _) <- createAndSecureQueue rh sPub
+      Resp "1" _ OK <- signSendRecv rh rKey ("1", rId, OFF)
+      (time, [Resp "2" _ (ERR AUTH), Resp "3" _ (ERR AUTH), Resp "4" _ (ERR AUTH)]) <- responseTime $ do
+        forM_ (["2", "3", "4"] :: [ByteString]) $ \corrId -> signSend_ sh sKey Nothing (corrId, sId, _SEND "hello")
+        replicateM 3 $ tGet1 sh
+      time `shouldSatisfy` (>= 1)
 
 responseTime :: IO a -> IO (NominalDiffTime, a)
 responseTime action = do
