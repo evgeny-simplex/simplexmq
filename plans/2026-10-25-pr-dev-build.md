@@ -47,8 +47,10 @@ This plan targets master's build.yml. Branch `ep/pr-dev-build` and PR #14 base `
    ```
    with `env: FAST_PR: ${{ env.fast_pr }}`. The runner passes CLI args to hspec `readConfig`, so `-m` filters (Test.hs:202). The Postgres service is present (build.yml:83-95) and `-fserver_postgres` compiles the Postgres specs; the committed patterns determine their inclusion.
 
-## Full build preserved
-Pushes to master and stable and tag builds keep the five-entry matrix, every target, -O2 (or the -O0 reseed on master and stable), and the full `./simplexmq-test` with retries. A pull request marked ready for review (`draft == false`) runs the five-entry matrix and the full `./simplexmq-test` at -O0; the reduced path keys on `fast_pr`, so it applies to drafts only. The resolver-test job (build.yml:468-485) is independent and unaffected.
+## Draft and full builds
+A draft pull request runs only the reduced build: the single 9.6.3 x86-64 22.04 job, the `simplexmq-test` target (the library and the test suite, skipping the four server executables), and the `tests/ci-fast.txt` subset, all at -O0. The warm `dist-postgres` cache (build.yml:225-237) limits recompilation to the units the change affects. Successive pushes to a draft re-run only this reduced build, so review feedback iterates without triggering the five-entry matrix.
+
+The full matrix runs on ready_for_review. A pull request marked ready (`draft == false`) runs the five-entry matrix and the full `./simplexmq-test` at -O0; the reduced path keys on `fast_pr`, so it applies to drafts only. Pushes to master and stable and tag builds keep the five-entry matrix, every target, -O2 (or the -O0 reseed on master and stable), and the full `./simplexmq-test` with retries. The resolver-test job (build.yml:468-485) is independent and unaffected.
 
 ## Validation
 The first draft pull request on the fork measures the warm reduced-build time.
