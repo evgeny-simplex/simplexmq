@@ -1207,7 +1207,7 @@ sendAfterDelay c@Client {sndQ, delayedResponses, clientTHParams = THandleParams 
   | delay > 0 = do
       atomically $ do
         delayed <- readTVar delayedResponses
-        when (delayed >= maxDelayed) retry
+        when (delayed >= max 1 maxDelayed) retry
         writeTVar delayedResponses $! delayed + 1
       elapsed <- subtract (microseconds since) . microseconds <$> getSystemTime
       when (elapsed >= delay) $ incStat $ authDelayExceeded stats
