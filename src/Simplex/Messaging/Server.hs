@@ -1204,16 +1204,13 @@ sendResponses c@Client {sndQ} stats authDelay maxDelayed since rs@(ts, _)
 
 sendAfterDelay :: Client s -> ServerStats -> Int64 -> Int -> SystemTime -> (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]) -> IO ()
 sendAfterDelay c@Client {sndQ, delayedResponses, clientTHParams = THandleParams {sessionId}} stats delay maxDelayed since rs
-  | delay > 0 = do
-      atomically $ do
-        delayed <- readTVar delayedResponses
-        when (delayed >= max 1 maxDelayed) retry
-        writeTVar delayedResponses $! delayed + 1
+  | delay > 0 = forkClientInSlot c delayedResponses waitSlot (pure ()) (B.unpack $ "client $" <> encode sessionId <> " auth") $ do
       elapsed <- subtract (microseconds since) . microseconds <$> getSystemTime
       when (elapsed >= delay) $ incStat $ authDelayExceeded stats
-      forkClient c (B.unpack $ "client $" <> encode sessionId <> " auth") $ (threadDelay' (delay - elapsed `mod` delay) >> write) `finally` atomically (modifyTVar' delayedResponses (subtract 1))
+      threadDelay' (delay - elapsed `mod` delay) >> write
   | otherwise = write
   where
+    waitSlot = atomically $ ifM (takeSlot delayedResponses $ max 1 maxDelayed) (pure True) retry
     write = atomically $ writeTBQueue sndQ rs
 
 updateSlotWaitStats :: ServerStats -> SystemTime -> Bool -> IO ()
@@ -1410,6 +1407,25 @@ forkClient Client {endThreads, endThreadSeq} label action = do
     action `finally` atomically (modifyTVar' endThreads $ IM.delete tId)
   mkWeakThreadId t >>= atomically . modifyTVar' endThreads . IM.insert tId
 
+forkClientInSlot :: MonadUnliftIO m => Client s -> TVar Int -> m Bool -> m () -> String -> m () -> m ()
+forkClientInSlot c slots wait noSlot label action =
+  -- Exceptions are masked so the slot is never lost between taking it and starting the thread.
+  -- The thread frees the slot when the command finishes; the caller frees it only if forking failed.
+  mask $ \restore ->
+    ifM
+      wait
+      (forkClient c label (restore action `finally` signal) `onException` signal)
+      (restore noSlot)
+  where
+    signal = atomically $ modifyTVar' slots (\t -> t - 1)
+
+takeSlot :: TVar Int -> Int -> STM Bool
+takeSlot slots limit = do
+  used <- readTVar slots
+  let free = used < limit
+  when free $ writeTVar slots $! used + 1
+  pure free
+
 client :: forall s. MsgStoreClass s => Server s -> s -> Client s -> M s ()
 client
   Server {subscribers, ntfSubscribers}
@@ -1523,13 +1539,7 @@ client
     forkCmd_ :: (ServerConfig s -> Int) -> (ServerConfig s -> Int) -> M s () -> M s () -> M s (Maybe a)
     forkCmd_ concurrency waitTimeout onTimeout cmd = do
       let label = B.unpack $ "client $" <> encode sessionId <> " cmd"
-      -- Exceptions are masked so the slot is never lost between taking it and starting the thread.
-      -- The thread frees the slot when the command finishes; the caller frees it only if forking failed.
-      mask $ \restore ->
-        ifM
-          wait
-          (forkClient clnt label (restore cmd `finally` signal) `onException` signal)
-          (restore onTimeout)
+      forkClientInSlot clnt procThreads wait onTimeout label cmd
       pure Nothing
       where
         -- Takes a free slot at once if there is one. Otherwise waits for a slot until the client
@@ -1537,20 +1547,14 @@ client
         -- Other commands of this client are not processed while it waits.
         wait = do
           limit <- asks (concurrency . config)
-          ifM (atomically $ takeSlot limit) (pure True) $ do
+          ifM (atomically $ takeSlot procThreads limit) (pure True) $ do
             clientTimeout <- asks $ waitTimeout . config
             waitStarted <- liftIO getSystemTime
             expired <- liftIO $ registerDelay clientTimeout
-            taken <- atomically $ ifM (takeSlot limit) (pure True) (ifM (readTVar expired) (pure False) retry)
+            taken <- atomically $ ifM (takeSlot procThreads limit) (pure True) (ifM (readTVar expired) (pure False) retry)
             stats <- asks serverStats
             liftIO $ updateSlotWaitStats stats waitStarted taken
             pure taken
-        takeSlot limit = do
-          used <- readTVar procThreads
-          let free = used < limit
-          when free $ writeTVar procThreads $! used + 1
-          pure free
-        signal = atomically $ modifyTVar' procThreads (\t -> t - 1)
     rslvNamesEnv :: M s (Maybe NamesEnv)
     rslvNamesEnv = do
       st <- asks (rslvStats . serverStats)
