@@ -8,6 +8,12 @@ We do not make code changes to improve code - any change must address a specific
 
 Please discuss the problem you want to solve and your detailed implementation plan with the project team prior to contributing, to avoid wasted time and additional changes. Acceptance of your contribution depends on your willingness and ability to iterate the proposed contribution to achieve the required quality level, coding style, test coverage, and alignment with user requirements as they are understood by the project team.
 
+Every plan is written in this format:
+1. The user problem and the requirements, in a few lines.
+2. The design, as decisions and mechanics.
+3. Tests.
+4. Open questions.
+
 ## Follow project structure, coding style and approaches
 
 ./PROJECT.md has information about the structure of this `simplexmq` repository.
