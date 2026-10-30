@@ -87,6 +87,7 @@ serverTests = do
     describe "GET & SUB commands" testGetSubCommands
     describe "Exceeding queue quota" testExceedQueueQuota
     describe "Concurrent sending and delivery" testConcurrentSendDelivery
+    describe "SUB and SEND in one block" testSubSendBlock
   describe "Service message subscriptions" $ do
     testServiceDeliverSubscribe
     testServiceUpgradeAndDowngrade
@@ -157,11 +158,14 @@ signSendRecv_ h pk serviceKey_ t = do
   tGetClient h
 
 signSend_ :: forall c p. (Transport c, PartyI p) => THandleSMP c 'TClient -> C.APrivateAuthKey -> Maybe C.PrivateKeyEd25519 -> (ByteString, EntityId, Command p) -> IO ()
-signSend_ h@THandle {params} (C.APrivateAuthKey a pk) serviceKey_ (corrId, qId, cmd) = do
-  let TransmissionForAuth {tForAuth, tToSend} = encodeTransmissionForAuth params (CorrId corrId, qId, cmd)
-  Right () <- tPut1 h (authorize tForAuth, tToSend)
+signSend_ h pk serviceKey_ t = do
+  Right () <- tPut1 h $ signTransmission h pk serviceKey_ t
   pure ()
+
+signTransmission :: PartyI p => THandleSMP c 'TClient -> C.APrivateAuthKey -> Maybe C.PrivateKeyEd25519 -> (ByteString, EntityId, Command p) -> SentRawTransmission
+signTransmission THandle {params} (C.APrivateAuthKey a pk) serviceKey_ (corrId, qId, cmd) = (authorize tForAuth, tToSend)
   where
+    TransmissionForAuth {tForAuth, tToSend} = encodeTransmissionForAuth params (CorrId corrId, qId, cmd)
     authorize t = (,(`C.sign'` t) <$> serviceKey_) <$> case a of
       C.SEd25519 -> Just . TASignature . C.ASignature C.SEd25519 $ C.sign' pk t'
       C.SEd448 -> Just . TASignature . C.ASignature C.SEd448 $ C.sign' pk t'
@@ -680,6 +684,23 @@ testConcurrentSendDelivery =
         isMsg1or2 mId2 msg2
         Resp "4" _ OK <- signSendRecv rh rKey ("4", rId, ACK mId2)
         pure ()
+
+testSubSendBlock :: SpecWith (ASrvTransport, AStoreType)
+testSubSendBlock =
+  it "should deliver message sent in the same block as SUB" $ \(ATransport t, msType) ->
+    smpTest t msType $ \h@THandle {params} -> do
+      g <- C.newRandom
+      (rPub, rKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+      (dhPub, dhPriv :: C.PrivateKeyX25519) <- atomically $ C.generateKeyPair g
+      Resp "1" NoEntity (Ids rId sId srvDh) <- signSendRecv h rKey ("1", NoEntity, NEW (NewQueueReq rPub dhPub Nothing SMOnlyCreate (Just (QRMessaging Nothing)) Nothing))
+      let dec = decryptMsgV3 $ C.dh' srvDh dhPriv
+          TransmissionForAuth {tToSend} = encodeTransmissionForAuth params (CorrId "3", sId, _SEND "hello")
+      [Right (), Right ()] <- tPut h [Right $ signTransmission h rKey Nothing ("2", rId, SUB), Right (Nothing, tToSend)]
+      Resp "" _ (Msg mId msg) <- tGet1 h
+      dec mId msg `shouldBe` Right "hello"
+      [Resp "2" _ (SOK Nothing), Resp "3" _ OK] <- tGetClient h
+      Resp "4" _ OK <- signSendRecv h rKey ("4", rId, ACK mId)
+      pure ()
 
 testServiceDeliverSubscribe :: SpecWith (ASrvTransport, AStoreType)
 testServiceDeliverSubscribe =
