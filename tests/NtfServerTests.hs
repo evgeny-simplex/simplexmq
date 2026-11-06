@@ -67,6 +67,8 @@ ntfServerTests ps@(t, _) = do
     it "rejects APNS test provider unless enabled" $ testApnsTestProviderRejected t
   describe "APNS client" $ do
     it "should validate APNS server certificate" testApnsServerCertificate
+  describe "Push worker" $ do
+    it "should deliver notification after push provider was unreachable" $ testPushAfterProviderFailure t
   describe "Database pool" $ do
     it "answers SNEW with one database connection" $ testSNEWOneDBConnection t
   describe "Notification subscriptions (NKEY)" $ testNotificationSubscription ps createNtfQueueNKEY
@@ -114,6 +116,21 @@ testApnsServerCertificate = withAPNSMockServer $ \_ -> do
   where
     NtfServerConfig {apnsConfig} = ntfServerCfg
     certError s (e :: IOError) = s `isInfixOf` show e
+
+testPushAfterProviderFailure :: HasTestEnv => ASrvTransport -> Expectation
+testPushAfterProviderFailure (ATransport t) = do
+  g <- C.newRandom
+  (tknPub, tknKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+  (dhPub, _dhPriv :: C.PrivateKeyX25519) <- atomically $ C.generateKeyPair g
+  let tkn = DeviceToken PPApnsTest "abcd"
+  ntfTest t $ \nh -> do
+    RespNtf "1" NoEntity (NRTknId tId _) <- signSendRecvNtf nh tknKey ("1", NoEntity, TNEW $ NewNtfTkn tkn tknPub dhPub)
+    threadDelay 7000000
+    withAPNSMockServer $ \apns -> do
+      RespNtf "2" NoEntity (NRTknId tId' _) <- signSendRecvNtf nh tknKey ("2", NoEntity, TNEW $ NewNtfTkn tkn tknPub dhPub)
+      tId' `shouldBe` tId
+      Just APNSMockRequest {notification = APNSNotification {aps = APNSBackground _}} <- 5000000 `timeout` getMockNotification apns tkn
+      pure ()
 
 testSNEWOneDBConnection :: HasTestEnv => ASrvTransport -> Expectation
 testSNEWOneDBConnection (ATransport (t :: TProxy c 'TServer)) = do
