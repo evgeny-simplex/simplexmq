@@ -80,6 +80,7 @@ import Simplex.Messaging.SystemTime
 import Simplex.Messaging.TMap (TMap)
 import Simplex.Messaging.Transport (ASrvTransport, ATransport (..), THandle (..), THandleAuth (..), THandleParams (..), TProxy, Transport (..), TransportPeer (..), defaultSupportedParams)
 import Simplex.Messaging.Transport.Buffer (trimCR)
+import Simplex.Messaging.Transport.HTTP2.Client (HTTP2ClientError (..))
 import Simplex.Messaging.Transport.Server (AddHTTP, runTransportServer, runLocalTCPServer)
 import Simplex.Messaging.Util
 import System.Environment (lookupEnv)
@@ -706,7 +707,7 @@ runPushWorker s srvHost_ isOwn q = forever $ do
       | status == NTActive = action
       | otherwise = liftIO $ logError "bad notification token status"
     deliverNotification :: NtfPostgresStore -> PushProvider -> NtfTknRec -> PushNotification -> IO (Either PushProviderError ())
-    deliverNotification st pp tkn@NtfTknRec {ntfTknId} ntf' = do
+    deliverNotification st pp tkn@NtfTknRec {ntfTknId} ntf' = flip catchOwn' (err . PPConnection . HCIOError . E.displayException) $ do
       (deliver, clientVar) <- getPushClient s pp
       runExceptT (deliver tkn ntf') >>= \case
         Right _ -> pure $ Right ()
