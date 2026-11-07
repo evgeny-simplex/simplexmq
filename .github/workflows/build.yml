@@ -87,8 +87,8 @@ jobs:
       packages: write
     env: &build-env
       apps: "smp-server xftp-server ntf-server xftp"
-      opt: ${{ github.event_name == 'push' && 'O2' || 'O0' }}
-      ghc_options: ${{ github.event_name != 'push' && '--ghc-options=-O0' || '' }}
+      opt: ${{ github.event_name != 'pull_request' && 'O2' || 'O0' }}
+      ghc_options: ${{ github.event_name == 'pull_request' && '--ghc-options=-O0' || '' }}
       release: ${{ startsWith(github.ref, 'refs/tags/v') }}
       postgres_dist: ${{ startsWith(github.ref, 'refs/tags/v') && 'dist-newstyle' || 'dist-postgres' }}
       branch: ${{ github.base_ref || github.ref_name }}
