@@ -318,8 +318,8 @@ connectionRequestTests =
       smpEncodingTest (aBinaryConnReq contactAddressClientData)
     it "should parse server without key hash only in short links as binary" $ do
       let addr = queueAddr {smpServer = shortSrv}
-      smpDecode @SMPQueueUri (smpEncode $ SMPQueueUri supportedSMPClientVRange addr) `shouldSatisfy` isLeft
       smpDecode @SMPQueueInfo (smpEncode $ SMPQueueInfo (VersionSMPC 1) addr) `shouldSatisfy` isLeft
+      smpDecode @SMPQueueUri (smpEncode $ SMPQueueUri supportedSMPClientVRange addr) `shouldSatisfy` isLeft
       smpEncodingTest $ ACSL SCMContact $ CSLContact SLSServer CCTContact shortSrv (LinkKey "0123456789abcdef0123456789abcdef")
       smpEncodingTest $ ACSL SCMInvitation $ CSLInvitation SLSServer shortSrv (EntityId "0123456789abcdef01234567") (LinkKey "0123456789abcdef0123456789abcdef")
     it "should serialize / parse short links" $ do
