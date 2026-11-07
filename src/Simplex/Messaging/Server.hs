@@ -2179,13 +2179,7 @@ client
           nonce_ <-
             if fwdVersion >= fwdNoncesSMPVersion
               then Just <$> (atomically . C.randomCbNonce =<< asks random)
-              else do
-                let fwdCorrId' = SBS.toShort $ C.unCbNonce fwdCorrId
-                usedIds <- atomically $ stateTVar fwdCorrIds $ \ids -> (ids, S.insert fwdCorrId' ids)
-                when (fwdCorrId' `S.member` usedIds) $ throwE CRYPTO
-                maxIds <- asks $ maxFwdCorrIds . config
-                when (S.size usedIds >= maxIds) $ throwIO $ userError "too many forwarded commands"
-                pure Nothing
+              else pure Nothing
           let clntThAuth = Just $ THAuthServer {serverPrivKey, peerClientService = Nothing, peerEntitlement = Nothing, sessSecret' = Just clientSecret}
               encodeResp r = do
                 r' <- case batchTransmissions clntTHParams [Right (Nothing, encodeTransmission clntTHParams r)] of
