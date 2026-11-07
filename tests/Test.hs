@@ -12,6 +12,7 @@ import CoreTests.CryptoTests
 import CoreTests.EncodingTests
 import CoreTests.LockTests
 import CoreTests.MsgStoreTests
+import CoreTests.NtfGroupingBenchmark
 import CoreTests.RetryIntervalTests
 import CoreTests.SOCKSSettings
 import CoreTests.StoreLogTests
@@ -144,6 +145,7 @@ main = do
           describe "Core tests" $ do
             describe "Retry interval tests" retryIntervalTests
             describe "Lock tests" lockTests
+            describe "ntf grouping benchmark" ntfGroupingBenchmark
 #if defined(dbServerPostgres)
           describe "SMP server via TLS, postgres-only message store" $
             before (pure (transport @TLS, ASType SQSPostgres SMSPostgres)) $ describe "Timing of AUTH error" testTiming
