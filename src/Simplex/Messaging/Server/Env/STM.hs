@@ -68,6 +68,7 @@ module Simplex.Messaging.Server.Env.STM
     defaultProxyClientConcurrency,
     defaultNameResolverConcurrency,
     defaultMaxClientCmdWait,
+    defaultMaxFwdCorrIds,
     defaultAuthErrorDelayMs,
     readWriteQueueStore,
     noPostgresExitStr,
@@ -82,6 +83,7 @@ import Control.Logger.Simple
 import Control.Monad
 import qualified Crypto.PubKey.RSA as RSA
 import Crypto.Random
+import Data.ByteString.Short (ShortByteString)
 import Data.Int (Int64)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
@@ -92,6 +94,7 @@ import Data.List (intercalate)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Maybe (isJust)
+import Data.Set (Set)
 import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Clock.System (SystemTime)
@@ -198,6 +201,7 @@ data ServerConfig s = ServerConfig
     -- requests), so bounding them by the per-client limit would throttle unduly.
     serverResolverConcurrency :: Int,
     maxClientCmdWait :: Int,
+    maxFwdCorrIds :: Int,
     -- | public-namespace resolver config; Nothing disables the names role
     namesConfig :: Maybe NamesConfig,
     -- | server public information
@@ -248,6 +252,9 @@ defaultNameResolverConcurrency = 5000
 
 defaultMaxClientCmdWait :: Int
 defaultMaxClientCmdWait = 60000000 -- microseconds
+
+defaultMaxFwdCorrIds :: Int
+defaultMaxFwdCorrIds = 65536
 
 defaultAuthErrorDelayMs :: Int64
 defaultAuthErrorDelayMs = 50
@@ -425,6 +432,7 @@ data Client s = Client
   { clientId :: ClientId,
     subscriptions :: TMap RecipientId Sub,
     ntfSubscriptions :: TMap NotifierId (),
+    fwdCorrIds :: TVar (Set ShortByteString),
     serviceSubscribed :: TVar Bool, -- set independently of serviceSubsCount, to track whether service subscription command was received
     ntfServiceSubscribed :: TVar Bool,
     serviceSubsCount :: TVar (Int64, IdsHash), -- only one service can be subscribed, based on its certificate, this is subscription count
@@ -498,6 +506,7 @@ newClient :: ClientId -> Natural -> THandleParams SMPVersion 'TServer -> SystemT
 newClient clientId qSize clientTHParams createdAt = do
   subscriptions <- TM.emptyIO
   ntfSubscriptions <- TM.emptyIO
+  fwdCorrIds <- newTVarIO mempty
   serviceSubscribed <- newTVarIO False
   ntfServiceSubscribed <- newTVarIO False
   serviceSubsCount <- newTVarIO (0, mempty)
@@ -516,6 +525,7 @@ newClient clientId qSize clientTHParams createdAt = do
       { clientId,
         subscriptions,
         ntfSubscriptions,
+        fwdCorrIds,
         serviceSubscribed,
         ntfServiceSubscribed,
         serviceSubsCount,

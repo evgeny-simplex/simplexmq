@@ -59,6 +59,7 @@ import qualified Data.ByteString.Builder as BLD
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
+import qualified Data.ByteString.Short as SBS
 import Data.Constraint (Dict (..))
 import Data.Dynamic (toDyn)
 import Data.Either (fromRight, partitionEithers)
@@ -1409,7 +1410,7 @@ client :: forall s. MsgStoreClass s => Server s -> s -> Client s -> M s ()
 client
   Server {subscribers, ntfSubscribers}
   ms
-  clnt@Client {clientId, rcvQ, sndQ, msgQ, clientTHParams = thParams'@THandleParams {sessionId}, procThreads} = do
+  clnt@Client {clientId, rcvQ, sndQ, msgQ, clientTHParams = thParams'@THandleParams {sessionId}, procThreads, fwdCorrIds} = do
     labelMyThread . B.unpack $ "client $" <> encode sessionId <> " commands"
     stats <- asks serverStats
     authDelay <- asks $ authErrorDelay . config
@@ -2175,6 +2176,16 @@ client
               | tCorrId == C.unCbNonce fwdCorrId -> pure $ tDecodeServer clntTHParams t
               | otherwise -> throwE CRYPTO
             _ -> throwE BLOCK
+          nonce_ <-
+            if fwdVersion >= fwdNoncesSMPVersion
+              then Just <$> (atomically . C.randomCbNonce =<< asks random)
+              else do
+                let fwdCorrId' = SBS.toShort $ C.unCbNonce fwdCorrId
+                usedIds <- atomically $ stateTVar fwdCorrIds $ \ids -> (ids, S.insert fwdCorrId' ids)
+                when (fwdCorrId' `S.member` usedIds) $ throwE CRYPTO
+                maxIds <- asks $ maxFwdCorrIds . config
+                when (S.size usedIds >= maxIds) $ throwIO $ userError "too many forwarded commands"
+                pure Nothing
           let clntThAuth = Just $ THAuthServer {serverPrivKey, peerClientService = Nothing, peerEntitlement = Nothing, sessSecret' = Just clientSecret}
               encodeResp r = do
                 r' <- case batchTransmissions clntTHParams [Right (Nothing, encodeTransmission clntTHParams r)] of
@@ -2182,10 +2193,6 @@ client
                   TBError _ _ : _ -> throwE BLOCK
                   TBTransmission b' _ : _ -> pure b'
                   TBTransmissions b' _ _ : _ -> pure b'
-                nonce_ <-
-                  if fwdVersion >= fwdNoncesSMPVersion
-                    then Just <$> (atomically . C.randomCbNonce =<< asks random)
-                    else pure Nothing
                 r2 <- liftEitherWith (const BLOCK) $ EncResponse <$> C.cbEncrypt clientSecret (fromMaybe (C.reverseNonce clientNonce) nonce_) r' paddedProxiedTLength
                 let fr = FwdResponse {fwdCorrId, fwdResponse = r2}
                 pure $ RRES nonce_ $ EncFwdResponse $ C.cbEncryptNoPad sessSecret (C.reverseNonce proxyNonce) (smpEncode fr)
