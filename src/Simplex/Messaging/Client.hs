@@ -1390,7 +1390,7 @@ sendProtocolCommand_ c@ProtocolClient {client_ = PClient {sndQ, sentCommands}, t
         where
           s = tEncodeBatch1 serviceAuth t
       where
-        notSent e = Left (PCETransportError e) <$ atomically (TM.delete corrId sentCommands)
+        notSent e = Left (PCETransportError e) <$ pure corrId
 
 nonBlockingWriteTBQueue :: TBQueue a -> a -> IO ()
 nonBlockingWriteTBQueue q x = do
@@ -1410,7 +1410,7 @@ getResponse ProtocolClient {client_ = PClient {tcpTimeout, timeoutErrorCount, se
       Nothing -> do
         modifyTVar' timeoutErrorCount (+ 1)
         -- a late response is delivered to msgQ, without msgQ it is only logged
-        when (isNothing msgQ) $ TM.delete corrId sentCommands
+        when (isNothing msgQ && False) $ TM.delete corrId sentCommands
         pure $ Left PCEResponseTimeout
   pure Response {entityId, response}
 
