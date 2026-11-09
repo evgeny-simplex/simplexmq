@@ -29,7 +29,7 @@ import qualified Data.Set as S
 import Data.Time.Clock (addUTCTime, getCurrentTime, nominalDay)
 import Data.Time.Clock.System (getSystemTime, systemSeconds)
 import SMPAgentClient (agentCfg, initAgentServers, noAuthSrvCfg, testDB, testDB2, testDB3, userServers)
-import SMPClient (testHost2, withStallingServerOn', xit'')
+import SMPClient (testHost, testHost2, withStallingServerOn', xit'')
 import Simplex.FileTransfer.Client (XFTPClientConfig (..))
 import Simplex.FileTransfer.Description (ChunkReplicaId (..), FileChunk (..), FileChunkReplica (..), FileDescription (..), FileDescriptionURI (..), FileDigest (..), FileSize (..), ValidFileDescription, fileDescriptionURI, kb, mb, qrSizeLimit, validateFileDescription, pattern ValidFileDescription)
 import Simplex.FileTransfer.Protocol (FileParty (..), GrantedStorageTime (..), SFileParty (..))
@@ -89,9 +89,11 @@ xftpAgentTests =
       it "should cleanup rcv tmp path after permanent error" $ \_ -> testXFTPAgentReceiveCleanup
       it "should report permanent error even when rcv tmp path cannot be removed" $ \_ -> testXFTPAgentReceiveCleanupError
       it "should limit download sessions with servers outside the user's list" $
-        testXFTPAgentDownloadSessionsLimit xftpServer2Only
+        testXFTPAgentDownloadSessionsLimit testXFTPServer2 initAgentServers
       it "should limit download sessions with servers outside the user's list in entity session mode" $
-        testXFTPAgentDownloadSessionsLimit $ entitySessionMode xftpServer2Only
+        testXFTPAgentDownloadSessionsLimit testXFTPServer2 $ entitySessionMode initAgentServers
+      it "should limit download sessions with servers outside the user's list whose second host is a host of the user's server" $
+        testXFTPAgentDownloadSessionsLimit testXFTPServer2 {host = testHost2 <> testHost} initAgentServers
       it "should release download sessions of stopped workers" testXFTPAgentDownloadSessionsStopped
       it "should keep download session with a server outside the user's list for all chunks of a file" $
         testXFTPAgentDownloadSessionChunks xftpServer2Only 1
@@ -101,7 +103,7 @@ xftpAgentTests =
         testXFTPAgentDownloadSessions (entitySessionMode initAgentServers) 0
       it "should keep download session shared with the user's server" $ testXFTPAgentDownloadSessions initAgentServers 1
       it "should keep download session with a disabled server in the user's list" $
-        testXFTPAgentDownloadSessions initAgentServers {AEnv.xftp = M.fromList [(1, noAuthSrvCfg testXFTPServer2 {host = testHost2} :| [(noAuthSrvCfg testXFTPServer) {AEnv.enabled = False}])]} 1
+        testXFTPAgentDownloadSessions initAgentServers {AEnv.xftp = M.fromList [(1, noAuthSrvCfg testXFTPServer2 :| [(noAuthSrvCfg testXFTPServer) {AEnv.enabled = False}])]} 1
       it "should resume sending file after restart" $ \_ -> testXFTPAgentSendRestore
       xit'' "should cleanup snd prefix path after permanent error" $ \_ -> testXFTPAgentSendCleanup
       it "should delete sent file on server" testXFTPAgentDelete
@@ -612,10 +614,10 @@ testXFTPAgentReceiveCleanupError = withGlobalLogging logCfgNoLogs $ do
         `finally` setPermissions prefixPath perms
       doesDirectoryExist tmpPath `shouldReturn` True
 
-testXFTPAgentDownloadSessionsLimit :: (HasCallStack, HasTestEnv) => InitialAgentServers -> AFStoreType -> IO ()
-testXFTPAgentDownloadSessionsLimit rcpServers = withXFTPServer $ do
-  (filePath, rfd) <- sendTwoChunkFile initAgentServers {AEnv.xftp = userServers $ testXFTPServer {host = testHost2} :| []}
-  silentRfd <- silentServersDescription 6
+testXFTPAgentDownloadSessionsLimit :: (HasCallStack, HasTestEnv) => XFTPServer -> InitialAgentServers -> AFStoreType -> IO ()
+testXFTPAgentDownloadSessionsLimit silentSrv rcpServers = withXFTPServer $ do
+  (filePath, rfd) <- sendTwoChunkFile initAgentServers
+  silentRfd <- silentServersDescription silentSrv 6
   withStallingServerOn' xftpTestPort2 $ \accepted _ ->
     withAgent 2 agentCfg {AEnv.xftpMaxDownloadSessions = 1} rcpServers testDB2 $ \rcp -> do
       runRight_ $ xftpStartWorkers rcp (Just recipientFiles)
@@ -628,7 +630,7 @@ testXFTPAgentDownloadSessionsLimit rcpServers = withXFTPServer $ do
 testXFTPAgentDownloadSessionsStopped :: (HasCallStack, HasTestEnv) => AFStoreType -> IO ()
 testXFTPAgentDownloadSessionsStopped = withXFTPServer $ do
   (filePath, rfd) <- sendTwoChunkFile initAgentServers
-  silentRfd <- silentServersDescription 1
+  silentRfd <- silentServersDescription testXFTPServer2 1
   withStallingServerOn' xftpTestPort2 $ \accepted _ ->
     withAgent 2 agentCfg {AEnv.xftpMaxDownloadSessions = 1} xftpServer2Only testDB2 $ \rcp -> do
       runRight_ $ xftpStartWorkers rcp (Just recipientFiles)
@@ -639,13 +641,13 @@ testXFTPAgentDownloadSessionsStopped = withXFTPServer $ do
       runRight_ $ xftpStartWorkers rcp (Just recipientFiles)
       timeout 10000000 (runRight $ testReceiveCF' rcp rfd Nothing filePath (kb 320)) >>= (`shouldSatisfy` isJust)
 
-silentServersDescription :: HasTestEnv => Int -> IO (ValidFileDescription 'FRecipient)
-silentServersDescription n = do
+silentServersDescription :: XFTPServer -> Int -> IO (ValidFileDescription 'FRecipient)
+silentServersDescription srv n = do
   g <- C.newRandom
   key <- atomically $ C.randomSbKey g
   nonce <- atomically $ C.randomCbNonce g
   (_, replicaKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
-  let chunk i = FileChunk {chunkNo = i, chunkSize = FileSize $ kb 64, digest = FileDigest "abc", replicas = [FileChunkReplica {server = testXFTPServer2 {keyHash = C.KeyHash $ B.pack $ show i}, replicaId = ChunkReplicaId $ EntityId "abc", replicaKey}]}
+  let chunk i = FileChunk {chunkNo = i, chunkSize = FileSize $ kb 64, digest = FileDigest "abc", replicas = [FileChunkReplica {server = srv {keyHash = C.KeyHash $ B.pack $ show i}, replicaId = ChunkReplicaId $ EntityId "abc", replicaKey}]}
   either fail pure . validateFileDescription $
     FileDescription {party = SFRecipient, size = FileSize $ kb 64 * fromIntegral n, digest = FileDigest "abc", key, nonce, chunkSize = FileSize $ kb 64, chunks = map chunk [1 .. n], redirect = Nothing}
 
@@ -675,7 +677,7 @@ sendTwoChunkFile sndServers = do
   pure (filePath, rfd)
 
 xftpServer2Only :: HasTestEnv => InitialAgentServers
-xftpServer2Only = initAgentServers {AEnv.xftp = userServers $ testXFTPServer2 {host = testHost2} :| []}
+xftpServer2Only = initAgentServers {AEnv.xftp = userServers $ testXFTPServer2 :| []}
 
 entitySessionMode :: InitialAgentServers -> InitialAgentServers
 entitySessionMode servers = servers {AEnv.netCfg = (AEnv.netCfg servers) {AEnv.sessionMode = TSMEntity}}
