@@ -633,9 +633,10 @@ functionalAPITests ps = do
       withSmpServer ps testConnectionVerifyCodes
   describe "Delivery receipts" $ do
     it "should send and receive delivery receipt" $ withSmpServer ps testDeliveryReceipts
-    it "should deliver receipt again after client restart without acknowledgement" $ testDuplicateReceipt ps
+    it "should deliver receipt again after client restart without acknowledgement" $ testDuplicateReceipt ps False
+    it "should deliver receipt again after client restart before its status is saved" $ testDuplicateReceipt ps True
     it "should delete sent message after its receipt is acknowledged" $ withSmpServer ps testReceiptDeletesSentMessage
-    it "should accept receipt for deleted sent message" $ withSmpServer ps testReceiptForDeletedSentMessage
+    it "should accept and delete receipt for deleted sent message" $ withSmpServer ps testReceiptForDeletedSentMessage
     it "send delivery receipts concurrently with messages" $ testDeliveryReceiptsConcurrent ps
   describe "Connections with apps of earlier versions" $ do
     describe "app with agent versions 2-6, client versions 1-3, e2e versions 2-3" $
@@ -3056,6 +3057,19 @@ processedRatchetKeyHashes c = withTransaction (store $ agentEnv c) (`DB.query_` 
 sndMessages :: AgentClient -> IO [(ConnId, Int64)]
 sndMessages c = withTransaction (store $ agentEnv c) (`DB.query_` "SELECT conn_id, internal_id FROM snd_messages ORDER BY conn_id, internal_id")
 
+rcvMessages :: AgentClient -> IO [(ConnId, Int64)]
+rcvMessages c = withTransaction (store $ agentEnv c) (`DB.query_` "SELECT conn_id, internal_id FROM rcv_messages ORDER BY conn_id, internal_id")
+
+waitDeleted :: HasCallStack => IO [(ConnId, Int64)] -> (ConnId, Int64) -> IO ()
+waitDeleted getMsgs msg = go (100 :: Int)
+  where
+    go n = do
+      msgs <- getMsgs
+      when (msg `elem` msgs) $
+        if n > 0
+          then threadDelay 100000 >> go (n - 1)
+          else expectationFailure $ "message was not deleted: " <> show msg
+
 getMsg :: AgentClient -> ConnId -> ExceptT AgentErrorType IO a -> ExceptT AgentErrorType IO a
 getMsg c cId action = do
   liftIO $ noMessages c "nothing should be delivered before GET"
@@ -4518,8 +4532,8 @@ testDeliveryReceipts =
     ackMessage b aId 5 (Just "") `catchError` \case (A.CMD PROHIBITED _) -> pure (); e -> liftIO $ expectationFailure ("unexpected error " <> show e)
     ackMessage b aId 5 Nothing
 
-testDuplicateReceipt :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> IO ()
-testDuplicateReceipt ps = do
+testDuplicateReceipt :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> Bool -> IO ()
+testDuplicateReceipt ps statusLost = do
   alice <- getSMPAgentClient' 1 agentCfg initAgentServers testDB
   bob <- getSMPAgentClient' 2 agentCfg initAgentServers testDB2
   withSmpServerStoreMsgLogOn ps testPort $ \_ -> do
@@ -4530,6 +4544,8 @@ testDuplicateReceipt ps = do
       get bob =##> \case ("", c, Msg "hello") -> c == aliceId; _ -> False
       ackMessage bob aliceId 2 $ Just ""
       get alice =##> \case ("", c, Rcvd 2) -> c == bobId; _ -> False
+    when statusLost $
+      withTransaction (store $ agentEnv alice) (`DB.execute_` "UPDATE snd_messages SET rcpt_internal_id = NULL, rcpt_status = NULL")
     disposeAgentClient alice
     threadDelay 250000
     alice1 <- getSMPAgentClient' 3 agentCfg initAgentServers testDB
@@ -4550,7 +4566,7 @@ testReceiptDeletesSentMessage =
     ackMessage b aId 2 $ Just ""
     get a =##> \case ("", c, Rcvd 2) -> c == bId; _ -> False
     ackMessage a bId 3 Nothing
-    liftIO $ sndMessages a >>= (`shouldNotContain` [(bId, 2)])
+    liftIO $ waitDeleted (sndMessages a) (bId, 2)
 
 testReceiptForDeletedSentMessage :: (HasCallStack, HasTestEnv) => IO ()
 testReceiptForDeletedSentMessage =
@@ -4563,7 +4579,8 @@ testReceiptForDeletedSentMessage =
     ackMessage b aId 2 $ Just ""
     mId <- sendMessage b aId SMP.noMsgFlags "hi"
     get b ##> ("", aId, SENT mId)
-    get a =##> \case ("", c, Msg "hi") -> c == bId; _ -> False
+    get a =##> \case ("", c, Msg' 4 PQEncOn "hi") -> c == bId; _ -> False
+    liftIO $ waitDeleted (rcvMessages a) (bId, 3)
 
 testDeliveryReceiptsConcurrent :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> IO ()
 testDeliveryReceiptsConcurrent (t, msType) =
