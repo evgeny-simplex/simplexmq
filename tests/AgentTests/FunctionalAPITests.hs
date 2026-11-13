@@ -454,6 +454,8 @@ functionalAPITests ps = do
       testDeliverClientRestart ps
     it "should deliver messages to the user once, even if repeat delivery is made by the server (no ACK)" $
       testDuplicateMessage ps
+    it "should deliver message again after client restart when a message was sent after it" $
+      testDuplicateMessageAfterSent ps
     it "should acknowledge a message again after it is deleted" $
       withSmpServer ps testAckDeletedMessage
     it "should report error via msg integrity on skipped messages" $
@@ -2455,6 +2457,28 @@ testDuplicateMessage ps = do
   disposeAgentClient alice2
   disposeAgentClient bob2
 
+testDuplicateMessageAfterSent :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> IO ()
+testDuplicateMessageAfterSent ps = do
+  alice <- getSMPAgentClient' 1 agentCfg initAgentServers testDB
+  bob <- getSMPAgentClient' 2 agentCfg initAgentServers testDB2
+  withSmpServerStoreMsgLogOn ps testPort $ \_ -> do
+    (aliceId, bobId) <- runRight $ makeConnection alice bob
+    runRight_ $ do
+      2 <- sendMessage alice bobId SMP.noMsgFlags "hello"
+      get alice ##> ("", bobId, SENT 2)
+      get bob =##> \case ("", c, Msg' 2 PQEncOn "hello") -> c == aliceId; _ -> False
+      3 <- sendMessage bob aliceId SMP.noMsgFlags "hello too"
+      get bob ##> ("", aliceId, SENT 3)
+    disposeAgentClient bob
+    threadDelay 250000
+    bob1 <- getSMPAgentClient' 3 agentCfg initAgentServers testDB2
+    runRight_ $ do
+      subscribeConnection bob1 aliceId
+      get bob1 =##> \case ("", c, Msg' 2 PQEncOn "hello") -> c == aliceId; _ -> False
+      ackMessage bob1 aliceId 2 Nothing
+    disposeAgentClient bob1
+  disposeAgentClient alice
+
 testAckDeletedMessage :: (HasCallStack, HasTestEnv) => IO ()
 testAckDeletedMessage =
   withAgentClients2 $ \alice bob -> runRight_ $ do
@@ -3059,6 +3083,9 @@ sndMessages c = withTransaction (store $ agentEnv c) (`DB.query_` "SELECT conn_i
 
 rcvMessages :: AgentClient -> IO [(ConnId, Int64)]
 rcvMessages c = withTransaction (store $ agentEnv c) (`DB.query_` "SELECT conn_id, internal_id FROM rcv_messages ORDER BY conn_id, internal_id")
+
+sndDeliveries :: AgentClient -> IO [(ConnId, Int64)]
+sndDeliveries c = withTransaction (store $ agentEnv c) (`DB.query_` "SELECT conn_id, internal_id FROM snd_message_deliveries ORDER BY conn_id, internal_id")
 
 waitDeleted :: HasCallStack => IO [(ConnId, Int64)] -> (ConnId, Int64) -> IO ()
 waitDeleted getMsgs msg = go (100 :: Int)
@@ -4541,6 +4568,7 @@ testDuplicateReceipt ps statusLost = do
     runRight_ $ do
       2 <- sendMessage alice bobId SMP.noMsgFlags "hello"
       get alice ##> ("", bobId, SENT 2)
+      liftIO $ waitDeleted (sndDeliveries alice) (bobId, 2)
       get bob =##> \case ("", c, Msg "hello") -> c == aliceId; _ -> False
       ackMessage bob aliceId 2 $ Just ""
       get alice =##> \case ("", c, Rcvd 2) -> c == bobId; _ -> False
@@ -4562,11 +4590,12 @@ testReceiptDeletesSentMessage =
     (aId, bId) <- makeConnection a b
     2 <- sendMessage a bId SMP.noMsgFlags "hello"
     get a ##> ("", bId, SENT 2)
+    liftIO $ waitDeleted (sndDeliveries a) (bId, 2)
     get b =##> \case ("", c, Msg "hello") -> c == aId; _ -> False
     ackMessage b aId 2 $ Just ""
     get a =##> \case ("", c, Rcvd 2) -> c == bId; _ -> False
     ackMessage a bId 3 Nothing
-    liftIO $ waitDeleted (sndMessages a) (bId, 2)
+    liftIO $ sndMessages a >>= (`shouldNotContain` [(bId, 2)])
 
 testReceiptForDeletedSentMessage :: (HasCallStack, HasTestEnv) => IO ()
 testReceiptForDeletedSentMessage =
@@ -4574,13 +4603,14 @@ testReceiptForDeletedSentMessage =
     (aId, bId) <- makeConnection a b
     2 <- sendMessage a bId SMP.noMsgFlags "hello"
     get a ##> ("", bId, SENT 2)
+    liftIO $ waitDeleted (sndDeliveries a) (bId, 2)
     get b =##> \case ("", c, Msg "hello") -> c == aId; _ -> False
     liftIO $ withTransaction (store $ agentEnv a) $ \db -> deleteSndMsgsExpired db 0 100
     ackMessage b aId 2 $ Just ""
     mId <- sendMessage b aId SMP.noMsgFlags "hi"
     get b ##> ("", aId, SENT mId)
     get a =##> \case ("", c, Msg' 4 PQEncOn "hi") -> c == bId; _ -> False
-    liftIO $ waitDeleted (rcvMessages a) (bId, 3)
+    liftIO $ rcvMessages a >>= (`shouldNotContain` [(bId, 3)])
 
 testDeliveryReceiptsConcurrent :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> IO ()
 testDeliveryReceiptsConcurrent (t, msType) =
