@@ -612,15 +612,14 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
                     incFileStat filesCount
                     liftIO $ atomicModifyIORef'_ (filesSize stats) (+ fromIntegral size)
                     pure FROk
-                  Left AUTH -> unreserve >> keepIfCommitted fPath
+                  Left AUTH -> do
+                    unreserve
+                    liftIO (getFile st SFSender senderId) >>= \case
+                      Right (FileRec {filePath = committed}, _) -> ifM (isJust <$> readTVarIO committed) (pure FROk) (FRErr AUTH <$ removeChunk fPath)
+                      Left AUTH -> FRErr AUTH <$ removeChunk fPath
+                      Left e -> pure $ FRErr e
                   Left e -> FRErr e <$ unreserve
               Left e -> FRErr e <$ release tmpPath
-          keepIfCommitted fPath = do
-            st <- asks fileStore
-            liftIO (getFile st SFSender senderId) >>= \case
-              Right (FileRec {filePath = committed}, _) -> ifM (isJust <$> readTVarIO committed) (pure FROk) (FRErr AUTH <$ removeChunk fPath)
-              Left AUTH -> FRErr AUTH <$ removeChunk fPath
-              Left e -> pure $ FRErr e
           removeChunk fPath = removeFile fPath `catch` \e -> unless (isDoesNotExistError e) $ logError $ "failed to remove file " <> tshow fPath <> ": " <> tshow e
           release fPath = do
             unreserve
