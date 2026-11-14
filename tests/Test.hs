@@ -4,8 +4,12 @@
 import AgentTests (agentCoreTests, agentTests)
 import AgentTests.FunctionalAPITests (functionalAPITimingTests)
 import CLITests
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (bracket_)
 import Control.Logger.Simple
+import Control.Monad (forever, when)
+import GHC.Clock (getMonotonicTime)
+import Simplex.Messaging.Diag (diagLog)
 import CoreTests.BatchingTests
 import CoreTests.CryptoFileTests
 import CoreTests.CryptoTests
@@ -68,8 +72,16 @@ import SMPClient (postgressBracket)
 logCfg :: LogConfig
 logCfg = LogConfig {lc_file = Nothing, lc_stderr = True}
 
+lagMonitor :: IO ()
+lagMonitor = forever $ do
+  t0 <- getMonotonicTime
+  threadDelay 1000000
+  t1 <- getMonotonicTime
+  when (t1 - t0 > 2) $ diagLog $ "scheduler lag " <> show (t1 - t0)
+
 main :: IO ()
 main = do
+  _ <- forkIO lagMonitor
   setLogLevel testLogLevel
   withGlobalLogging logCfg $ do
     setEnv "APNS_KEY_ID" "H82WD9K9AQ"

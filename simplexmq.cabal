@@ -142,6 +142,7 @@ library
       Simplex.Messaging.Crypto.SNTRUP761.Bindings.FFI
       Simplex.Messaging.Crypto.SNTRUP761.Bindings.RNG
       Simplex.Messaging.Crypto.ShortLink
+      Simplex.Messaging.Diag
       Simplex.Messaging.Encoding
       Simplex.Messaging.Encoding.String
       Simplex.Messaging.Names.Record

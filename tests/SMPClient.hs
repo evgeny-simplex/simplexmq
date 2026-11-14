@@ -30,6 +30,7 @@ import Simplex.Messaging.Agent.Store.Shared (MigrationConfirmation (..))
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientConfig (..), chooseTransportHost, defaultNetworkConfig)
 import Simplex.Messaging.Client.Agent (SMPClientAgentConfig (..), defaultSMPClientAgentConfig)
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagLog)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Protocol
 import Simplex.Messaging.Server (runSMPServerBlocking)
@@ -42,6 +43,7 @@ import Simplex.Messaging.Transport.Shared (ChainCertificates (..), chainIdCaCert
 import Simplex.Messaging.Util (ifM, unlessM)
 import Simplex.Messaging.Version
 import Simplex.Messaging.Version.Internal
+import GHC.Conc (threadStatus)
 import System.Info (os)
 import Test.Hspec hiding (fit, it)
 import UnliftIO.Concurrent
@@ -402,10 +404,11 @@ serverBracket process afterProcess f = do
   stopped <- newEmptyTMVarIO
   E.bracket
     (forkIOWithUnmask (\unmask -> (unmask (process started) `E.catchAny` handleStartError started startError) `E.finally` atomically (putTMVar stopped ())))
-    (\t -> forkIO (killThread t) >> afterProcess >> waitStopped stopped)
+    (\t -> forkIO (killThread t) >> afterProcess >> waitStopped stopped t)
     (\t -> checkStarted started startError >> f t >>= \r -> r <$ threadDelay 100000)
   where
     handleStartError started startError e = do
+      diagLog $ "serverBracket handleStartError: " <> show e
       atomically $ putTMVar startError e
       atomically $ putTMVar started False
       E.throwIO e
@@ -414,10 +417,13 @@ serverBracket process afterProcess f = do
         Nothing -> error "server did not start"
         Just True -> pure ()
         Just False -> atomically (readTMVar startError) >>= \e -> error $ "server did not start: " <> show e
-    waitStopped stopped = do
+    waitStopped stopped t = do
       delay <- registerDelay 30_000_000
       ok <- atomically $ (True <$ takeTMVar stopped) `orElse` (False <$ (readTVar delay >>= checkSTM))
-      unless ok $ error "server did not stop"
+      unless ok $ do
+        st <- threadStatus t
+        diagLog $ "serverBracket server did not stop, server thread " <> show t <> " status " <> show st
+        error "server did not stop"
 
 -- A TCP server that accepts connections but never performs a TLS handshake, so a client
 -- connecting to it stays blocked in the TLS handshake until its connection timeout.

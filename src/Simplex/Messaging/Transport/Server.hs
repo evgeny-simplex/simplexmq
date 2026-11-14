@@ -49,6 +49,7 @@ import Foreign.C.Error
 import GHC.IO.Exception (ioe_errno)
 import Network.Socket
 import qualified Network.TLS as T
+import Simplex.Messaging.Diag (diagWatch)
 import Simplex.Messaging.Transport
 import Simplex.Messaging.Transport.Shared
 import Simplex.Messaging.Util (catchAll_, labelMyThread, stateTVar', tshow, unlessM)
@@ -229,9 +230,13 @@ getSocketStats (accepted, closed, active) = do
 
 closeServer :: TMVar Bool -> TVar (IntMap (Weak ThreadId)) -> Socket -> IO ()
 closeServer started clients sock = do
-  close sock
-  readTVarIO clients >>= mapM_ (deRefWeak >=> mapM_ killThread)
-  void . atomically $ tryPutTMVar started False
+  addr <- either (\(e :: E.SomeException) -> show e) show <$> E.try (getSocketName sock)
+  diagWatch (pure $ "closeServer " <> addr) Nothing $ do
+    close sock
+    readTVarIO clients >>= mapM_ (killClient addr) . IM.toList
+    void . atomically $ tryPutTMVar started False
+  where
+    killClient addr (cId, w) = deRefWeak w >>= mapM_ (\t -> diagWatch (pure $ "closeServer " <> addr <> " kill client " <> show cId) (Just t) (killThread t))
 
 startTCPServer :: TMVar Bool -> Maybe HostName -> ServiceName -> IO Socket
 startTCPServer started host port = withSocketsDo $ resolve >>= open >>= setStarted
