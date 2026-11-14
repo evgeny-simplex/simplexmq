@@ -1,15 +1,23 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
 
 import AgentTests (agentCoreTests, agentTests)
 import AgentTests.FunctionalAPITests (functionalAPITimingTests)
 import CLITests
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, forkOn, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (bracket_)
 import Control.Logger.Simple
-import Control.Monad (forever, when)
+import Control.Monad (forever, unless, when)
+import Data.Version (showVersion)
 import GHC.Clock (getMonotonicTime)
-import Simplex.Messaging.Diag (diagLog)
+import GHC.Conc (closeFdWith, getNumCapabilities)
+import GHC.Event (closeFd, getSystemEventManager)
+import Simplex.Messaging.Diag (diagIOManagers, diagLog)
+import System.Environment (getExecutablePath)
+import System.Info (compilerVersion)
+import System.Posix.Types (Fd (..))
+import System.Process (callProcess)
 import CoreTests.BatchingTests
 import CoreTests.CryptoFileTests
 import CoreTests.CryptoTests
@@ -75,12 +83,36 @@ logCfg = LogConfig {lc_file = Nothing, lc_stderr = True}
 lagMonitor :: IO ()
 lagMonitor = forever $ do
   t0 <- getMonotonicTime
-  threadDelay 1000000
+  threadDelay 5000000
   t1 <- getMonotonicTime
-  when (t1 - t0 > 2) $ diagLog $ "scheduler lag " <> show (t1 - t0)
+  when (t1 - t0 > 6) $ diagLog $ "scheduler lag " <> show (t1 - t0)
+  blocked <- diagIOManagers
+  unless (null blocked) $ diagLog $ "IO manager callback tables blocked (capability, bucket): " <> show blocked
+
+closeFdWithRepro :: IO ()
+closeFdWithRepro = do
+  n <- getNumCapabilities
+  diagLog $ "closeFdWith repro: GHC " <> showVersion compilerVersion <> ", capabilities " <> show n
+  held <- newEmptyMVar
+  release <- newEmptyMVar
+  _ <- forkOn 1 $ getSystemEventManager >>= mapM_ (\mgr -> closeFd mgr (\_ -> putMVar held () >> takeMVar release) (Fd 1048583))
+  takeMVar held
+  closer <- forkOn 0 $ closeFdWith (\_ -> pure ()) (Fd 1048615)
+  threadDelay 100000
+  _ <- forkIO $ killThread closer
+  threadDelay 100000
+  putMVar release ()
+  threadDelay 100000
+  blocked <- diagIOManagers
+  diagLog $ "closeFdWith repro: killed while waiting for a callback table, blocked (capability, bucket): " <> show blocked
 
 main :: IO ()
-main = do
+main = getArgs >>= \case
+  ["closefdwith-repro"] -> closeFdWithRepro
+  _ -> mainTests
+
+mainTests :: IO ()
+mainTests = do
   _ <- forkIO lagMonitor
   setLogLevel testLogLevel
   withGlobalLogging logCfg $ do
@@ -213,6 +245,9 @@ main = do
           after_ (listDirectory tmpDir >>= mapM_ (removeFileIfExists . (tmpDir </>))) $
             describe "Agent SQLite schema dump" schemaDumpTest
 #endif
+          describe "GHC closeFdWith" $
+            it "killed while waiting for a callback table, in a subprocess" $
+              getExecutablePath >>= \p -> callProcess p ["closefdwith-repro"]
 
 hspecInTmpDir :: Spec -> IO ()
 hspecInTmpDir spec = do

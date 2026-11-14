@@ -30,7 +30,7 @@ import Simplex.Messaging.Agent.Store.Shared (MigrationConfirmation (..))
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientConfig (..), chooseTransportHost, defaultNetworkConfig)
 import Simplex.Messaging.Client.Agent (SMPClientAgentConfig (..), defaultSMPClientAgentConfig)
 import qualified Simplex.Messaging.Crypto as C
-import Simplex.Messaging.Diag (diagLog)
+import Simplex.Messaging.Diag (diagIOManagers, diagLog)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Protocol
 import Simplex.Messaging.Server (runSMPServerBlocking)
@@ -422,7 +422,8 @@ serverBracket process afterProcess f = do
       ok <- atomically $ (True <$ takeTMVar stopped) `orElse` (False <$ (readTVar delay >>= checkSTM))
       unless ok $ do
         st <- threadStatus t
-        diagLog $ "serverBracket server did not stop, server thread " <> show t <> " status " <> show st
+        blocked <- diagIOManagers
+        diagLog $ "serverBracket server did not stop, server thread " <> show t <> " status " <> show st <> ", IO manager callback tables blocked (capability, bucket): " <> show blocked
         error "server did not stop"
 
 -- A TCP server that accepts connections but never performs a TLS handshake, so a client
