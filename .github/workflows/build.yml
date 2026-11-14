@@ -476,11 +476,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: 24.04
-            os_underscore: 24_04
+          - os: 22.04
+            os_underscore: 22_04
             arch: x86-64
-            runner: "ubuntu-24.04"
-            ghc: "9.6.3"
+            runner: "ubuntu-22.04"
+            ghc: "8.10.7"
             should_run: true
     steps: *build-steps
 
