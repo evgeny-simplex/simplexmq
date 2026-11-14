@@ -32,7 +32,6 @@ import qualified Simplex.Messaging.Agent.Store.Postgres.Migrations as Migrations
 import Simplex.Messaging.Agent.Store.Postgres.Common
 import qualified Simplex.Messaging.Agent.Store.Postgres.DB as DB
 import Simplex.Messaging.Agent.Store.Shared (Migration (..), MigrationConfig (..), MigrationError (..))
-import Simplex.Messaging.Diag (diagWatch)
 import Simplex.Messaging.Util (ifM, safeDecodeUtf8)
 import System.Exit (exitFailure)
 
@@ -118,20 +117,13 @@ doesSchemaExist db schema = do
   pure schemaExists
 
 closeDBStore :: DBStore -> IO ()
-closeDBStore DBStore {dbSchema, dbPoolSize, dbPriorityPool, dbPool, dbClosed} =
+closeDBStore DBStore {dbPoolSize, dbPriorityPool, dbPool, dbClosed} =
   ifM (readTVarIO dbClosed) (putStrLn "closeDBStore: already closed") $ uninterruptibleMask_ $ do
-    closedCount <- newTVarIO (0 :: Int)
-    diagWatch (label closedCount) Nothing $ do
-      closePool closedCount dbPriorityPool
-      closePool closedCount dbPool
+    closePool dbPriorityPool
+    closePool dbPool
     atomically $ writeTVar dbClosed True
   where
-    closePool cnt pool = replicateM_ dbPoolSize $ do
-      atomically (readTBQueue $ dbPoolConns pool) >>= DB.close
-      atomically $ modifyTVar' cnt (+ 1)
-    label cnt = do
-      n <- readTVarIO cnt
-      pure $ "closeDBStore " <> show dbSchema <> " closed " <> show n <> " of " <> show (2 * dbPoolSize)
+    closePool pool = replicateM_ dbPoolSize $ atomically (readTBQueue $ dbPoolConns pool) >>= DB.close
 
 reopenDBStore :: DBStore -> IO ()
 reopenDBStore st =

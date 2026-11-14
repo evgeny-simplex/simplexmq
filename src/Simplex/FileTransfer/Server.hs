@@ -59,7 +59,6 @@ import Simplex.FileTransfer.Transport
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.BBS (BBSPresHeader (..))
 import Simplex.Messaging.Crypto.Entitlement (Entitlement (..), EntitlementProof (..), EntitlementVerification (..), verifyEntitlement)
-import Simplex.Messaging.Diag (diagLog, diagWatch)
 import qualified Simplex.Messaging.Crypto.Lazy as LC
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
@@ -123,7 +122,7 @@ runXFTPServer cfg = do
   runXFTPServerBlocking started cfg
 
 runXFTPServerBlocking :: FileStoreClass s => TMVar Bool -> XFTPServerConfig s -> IO ()
-runXFTPServerBlocking started cfg@XFTPServerConfig {xftpPort} = diagWatch (pure $ "XFTP " <> xftpPort <> " env") Nothing (newXFTPServerEnv cfg) >>= runReaderT (xftpServer cfg started)
+runXFTPServerBlocking started cfg = newXFTPServerEnv cfg >>= runReaderT (xftpServer cfg started)
 
 data Handshake
   = HandshakeSent C.PrivateKeyX25519 EntitlementChecked
@@ -136,17 +135,15 @@ xftpServer :: forall s. FileStoreClass s => XFTPServerConfig s -> TMVar Bool -> 
 xftpServer cfg@XFTPServerConfig {xftpPort, transportConfig, inactiveClientExpiration, fileExpiration, xftpServerVRange, information} started = do
   expireServerFiles Nothing fileExpiration
   restoreServerStats
-  diag "starting"
   raceAny_
-    ( (runServer `finally` diag "runServer exited")
-        : (expireFiles fileExpiration `finally` diag "expireFiles exited")
+    ( runServer
+        : expireFiles fileExpiration
         : serverStatsThread_ cfg
           <> prometheusMetricsThread_ cfg
           <> controlPortThread_ cfg
     )
-    `finally` (diag "children stopped" >> stopServer >> diag "stopServer done")
+    `finally` stopServer
   where
-    diag s = liftIO $ diagLog $ "XFTP " <> xftpPort <> ": " <> s
     runServer :: M s ()
     runServer = do
       srvCreds@(chain, pk) <- asks tlsServerCreds

@@ -24,7 +24,6 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import qualified Data.CaseInsensitive as CI
 import Data.Either (isLeft)
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (find, isInfixOf)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Time.Clock (getCurrentTime)
@@ -44,7 +43,6 @@ import Simplex.FileTransfer.Transport (XFTPClientHandshake (..), XFTPClientHello
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientError (..), defaultNetworkConfig)
 import qualified Simplex.Messaging.Crypto as C
 import qualified Simplex.Messaging.Crypto.Lazy as LC
-import Simplex.Messaging.Diag (diagWatch)
 import Simplex.Messaging.Encoding (smpDecode, smpEncode)
 import Simplex.Messaging.Protocol (BasicAuth, EntityId (..), RecipientId, SenderId, pattern NoEntity)
 import Simplex.Messaging.Server.Expiration (ExpirationConfig (..))
@@ -58,7 +56,7 @@ import Simplex.Messaging.Version (mkVersionRange)
 import System.Directory (listDirectory, removeFile)
 import System.FilePath ((</>))
 import Test.Hspec hiding (fit, it)
-import UnliftIO.Async (async, asyncThreadId, cancel, pooledReplicateConcurrentlyN, race_)
+import UnliftIO.Async (async, cancel, pooledReplicateConcurrentlyN, race_)
 import UnliftIO.STM
 import UnliftIO.Timeout (timeout)
 import Util
@@ -77,7 +75,7 @@ xftpServerTests = do
       it "should disconnect inactive clients" testInactiveClientExpiration
       it "should close connection when connecting client is cancelled" $ \_ -> testCancelledClientConnect
       it "should not allow uploading chunks after specified storage quota" testFileStorageQuota
-      forM_ (enumFromTo 1 30 :: [Int]) $ \i -> it ("should release storage of interrupted uploads " <> show i) testInterruptedUploadStorage
+      it "should release storage of interrupted uploads" testInterruptedUploadStorage
       it "should store file records to log and restore them after server restart" testFileLog
       describe "XFTP basic auth" $ do
         --                                               allow FNEW | server auth | clnt auth | success
@@ -295,21 +293,16 @@ testInterruptedUploadStorage fsType = withXFTPServerConfigOn (updateXFTPCfg (cfg
     digest <- LC.sha256Hash <$> LB.readFile testChunkPath
     let file = FileInfo {sndKey, size = chSize, digest}
         chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = chSize}
-        interruptUpload = do
-          step <- newIORef ("connect" :: String)
-          diagWatch (("interruptUpload " <>) <$> readIORef step) Nothing $ testXFTPClient $ \c@XFTPClient {http2Client, thParams} -> do
-            writeIORef step "FNEW"
-            (sId, _) <- runRight $ createXFTPChunk c spKey file [rcvKey] Nothing
-            t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams spKey ("", sId, FileCmd SFSender FPUT)
-            let req = H2.requestStreaming "POST" "/" [] $ \send flush -> do
-                  send $ byteString t
-                  send $ byteString $ B.replicate 1024 'x'
-                  flush
-                  threadDelay maxBound
-            writeIORef step "FPUT"
-            race_ (HC.sendRequest http2Client req Nothing) (threadDelay 20000)
-            writeIORef step "close"
-            sId <$ diagWatch (pure "closeXFTPClient") (asyncThreadId <$> HC.action http2Client) (closeXFTPClient c)
+        interruptUpload = testXFTPClient $ \c@XFTPClient {http2Client, thParams} -> do
+          (sId, _) <- runRight $ createXFTPChunk c spKey file [rcvKey] Nothing
+          t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams spKey ("", sId, FileCmd SFSender FPUT)
+          let req = H2.requestStreaming "POST" "/" [] $ \send flush -> do
+                send $ byteString t
+                send $ byteString $ B.replicate 1024 'x'
+                flush
+                threadDelay maxBound
+          race_ (HC.sendRequest http2Client req Nothing) (threadDelay 20000)
+          sId <$ closeXFTPClient c
     sIds <- pooledReplicateConcurrentlyN 10 300 interruptUpload
     threadDelay 1000000
     listDirectory xftpServerFiles `shouldReturn` []
