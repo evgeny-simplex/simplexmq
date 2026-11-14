@@ -8,8 +8,11 @@ import CLITests
 import Control.Concurrent (forkIO, forkOn, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (bracket_)
 import Control.Logger.Simple
-import Control.Monad (forever, unless, when)
+import Control.Monad (forM_, forever, replicateM_, unless, void, when)
+import Control.Monad.Except (runExceptT)
+import qualified Data.ByteString as B
 import Data.Version (showVersion)
+import Simplex.FileTransfer.Transport (XFTPRcvChunkSpec (..), receiveFile)
 import GHC.Clock (getMonotonicTime)
 import GHC.Conc (closeFdWith, getNumCapabilities)
 import GHC.Event (closeFd, getSystemEventManager)
@@ -106,9 +109,29 @@ closeFdWithRepro = do
   blocked <- diagIOManagers
   diagLog $ "closeFdWith repro: killed while waiting for a callback table, blocked (capability, bucket): " <> show blocked
 
+receiveFileRepro :: IO ()
+receiveFileRepro = do
+  n <- getNumCapabilities
+  diagLog $ "receiveFile repro: GHC " <> showVersion compilerVersion <> ", capabilities " <> show n
+  createDirectoryIfMissing True tmpDir
+  held <- newEmptyMVar
+  release <- newEmptyMVar
+  forM_ [0 .. 31] $ \bucket ->
+    forkOn 1 $ getSystemEventManager >>= mapM_ (\mgr -> closeFd mgr (\_ -> putMVar held () >> takeMVar release) (Fd $ 1048576 + bucket))
+  replicateM_ 32 $ takeMVar held
+  worker <- forkOn 0 $ void $ runExceptT $ receiveFile (\_ -> pure B.empty) (XFTPRcvChunkSpec (tmpDir </> "receive-file-repro") 1024 B.empty)
+  threadDelay 100000
+  _ <- forkIO $ killThread worker
+  threadDelay 100000
+  replicateM_ 32 $ putMVar release ()
+  threadDelay 100000
+  blocked <- diagIOManagers
+  diagLog $ "receiveFile repro: killed while closing the received file, blocked (capability, bucket): " <> show blocked
+
 main :: IO ()
 main = getArgs >>= \case
   ["closefdwith-repro"] -> closeFdWithRepro
+  ["receivefile-repro"] -> receiveFileRepro
   _ -> mainTests
 
 mainTests :: IO ()
@@ -245,9 +268,11 @@ mainTests = do
           after_ (listDirectory tmpDir >>= mapM_ (removeFileIfExists . (tmpDir </>))) $
             describe "Agent SQLite schema dump" schemaDumpTest
 #endif
-          describe "GHC closeFdWith" $
+          describe "GHC closeFdWith" $ do
             it "killed while waiting for a callback table, in a subprocess" $
               getExecutablePath >>= \p -> callProcess p ["closefdwith-repro"]
+            it "receiveFile killed while closing the received file, in a subprocess" $
+              getExecutablePath >>= \p -> callProcess p ["receivefile-repro"]
 
 hspecInTmpDir :: Spec -> IO ()
 hspecInTmpDir spec = do
