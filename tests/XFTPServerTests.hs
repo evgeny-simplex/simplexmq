@@ -332,18 +332,16 @@ testConcurrentChunkUpload = xftpTest2 $ \c@XFTPClient {http2Client, thParams} c'
         atomically $ takeTMVar resume
         send $ byteString part2
         flush
-      serverFile = xftpServerFiles </> serverFileName sId
-      waitServerFile = unlessM (doesFileExist serverFile) $ threadDelay 10000 >> waitServerFile
+      waitUploadFile = whenM (null <$> listDirectory xftpServerFiles) $ threadDelay 10000 >> waitUploadFile
   upload1 <- async $ HC.sendRequest http2Client req Nothing
-  timeout 5000000 waitServerFile `shouldReturn` Just ()
-  upload2 <- async $ runExceptT $ uploadXFTPChunk c' spKey sId chunkSpec
-  timeout 1000000 (wait upload2) `shouldReturn` Nothing
+  timeout 5000000 waitUploadFile `shouldReturn` Just ()
+  timeout 5000000 (runExceptT $ uploadXFTPChunk c' spKey sId chunkSpec) `shouldReturn` Just (Right ())
   atomically $ putTMVar resume ()
   HC.HTTP2Response {HC.respBody = HTTP2Body {bodyHead}} <- either (error . show) pure =<< wait upload1
   case xftpDecodeTClient thParams bodyHead of
     Right (_, _, Right FROk) -> pure ()
     r -> expectationFailure $ "unexpected response: " <> show r
-  wait upload2 `shouldReturn` Right ()
+  listDirectory xftpServerFiles `shouldReturn` [serverFileName sId]
   runRight_ $ downloadXFTPChunk g c' rpKey rId $ XFTPRcvChunkSpec (testPath "received_chunk1") chSize digest
   B.readFile (testPath "received_chunk1") `shouldReturn` bytes
 

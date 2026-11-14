@@ -574,23 +574,13 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
         pure $ FRRcvIds rIds
       pure $ either FRErr id r
     receiveServerFile :: FileRec -> M s FileResponse
-    receiveServerFile FileRec {senderId, fileInfo = FileInfo {size, digest}} = case bodyPart of
+    receiveServerFile FileRec {senderId, fileInfo = FileInfo {size, digest}, filePath} = case bodyPart of
       Nothing -> pure $ FRErr SIZE
       -- TODO validate body size from request before downloading, once it's populated
-      Just getBody -> withUploadLock receiveUncommitted >>= maybe skipCommitted pure
+      Just getBody -> skipCommitted $ mask $ \restore -> ifM reserve (receive restore) (pure $ FRErr QUOTA)
         where
-          withUploadLock a = do
-            uploads <- asks uploadingFiles
-            bracket_ (atomically $ ifM (TM.member senderId uploads) retrySTM (TM.insert senderId () uploads)) (atomically $ TM.delete senderId uploads) a
           -- having a filePath means the file is already uploaded and committed, must not change anything
-          receiveUncommitted = do
-            st <- asks fileStore
-            liftIO (getFile st SFSender senderId) >>= \case
-              Right (FileRec {filePath}, _) ->
-                ifM (isJust <$> readTVarIO filePath) (pure Nothing) $
-                  Just <$> mask (\restore -> ifM reserve (receive restore) (pure $ FRErr QUOTA))
-              Left e -> pure $ Just $ FRErr e
-          skipCommitted = liftIO $ drain $ fromIntegral size
+          skipCommitted = ifM (isJust <$> readTVarIO filePath) (liftIO $ drain $ fromIntegral size)
             where
               -- can't send FROk without reading the request body or a client will block on sending it
               -- can't send any old error as the client would fail or restart indefinitely
@@ -607,9 +597,12 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
               \used -> let used' = used + fromIntegral size in if used' <= quota then (True, used') else (False, used)
           receive restore = do
             path <- asks $ filesPath . config
+            suffix <- randomId 12
             let fPath = path </> serverFileName senderId
-            (restore (receiveChunk $ XFTPRcvChunkSpec fPath size digest) `onException` release fPath) >>= \case
+                tmpPath = fPath <> "." <> B.unpack (strEncode suffix)
+            (restore (receiveChunk $ XFTPRcvChunkSpec tmpPath size digest) `onException` release tmpPath) >>= \case
               Right () -> do
+                renameFile tmpPath fPath `onException` release tmpPath
                 stats <- asks serverStats
                 st <- asks fileStore
                 liftIO (setFilePath st senderId fPath) >>= \case
@@ -619,12 +612,22 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
                     incFileStat filesCount
                     liftIO $ atomicModifyIORef'_ (filesSize stats) (+ fromIntegral size)
                     pure FROk
-                  Left _e -> FRErr AUTH <$ release fPath
-              Left e -> FRErr e <$ release fPath
+                  Left AUTH -> unreserve >> keepIfCommitted fPath
+                  Left e -> FRErr e <$ unreserve
+              Left e -> FRErr e <$ release tmpPath
+          keepIfCommitted fPath = do
+            st <- asks fileStore
+            liftIO (getFile st SFSender senderId) >>= \case
+              Right (FileRec {filePath = committed}, _) -> ifM (isJust <$> readTVarIO committed) (pure FROk) (FRErr AUTH <$ removeChunk fPath)
+              Left AUTH -> FRErr AUTH <$ removeChunk fPath
+              Left e -> pure $ FRErr e
+          removeChunk fPath = removeFile fPath `catch` \e -> unless (isDoesNotExistError e) $ logError $ "failed to remove file " <> tshow fPath <> ": " <> tshow e
           release fPath = do
+            unreserve
+            liftIO $ whenM (doesFileExist fPath) (removeFile fPath) `catch` logFileError
+          unreserve = do
             us <- asks usedStorage
             atomically $ modifyTVar' us $ subtract (fromIntegral size)
-            liftIO $ whenM (doesFileExist fPath) (removeFile fPath) `catch` logFileError
           receiveChunk spec = do
             t <- asks $ fileTimeout . config
             liftIO $ fromMaybe (Left TIMEOUT) <$> timeout t (runExceptT $ receiveFile getBody spec)
@@ -678,20 +681,19 @@ blockServerFile fr@FileRec {senderId} info = mask_ $ do
 deleteOrBlockServerFile_ :: FileStoreClass s => FileRec -> (FileServerStats -> IORef Int) -> (s -> IO (Either XFTPErrorType (Maybe FilePath))) -> M s (Either XFTPErrorType ())
 deleteOrBlockServerFile_ FileRec {filePath, fileInfo} stat storeAction = runExceptT $ do
   path <- readTVarIO filePath
-  stats <- asks serverStats
-  ExceptT $ first (\(_ :: SomeException) -> FILE_IO) <$> try (mapM_ (removeServerFile stats) path)
+  ExceptT $ first (\(_ :: SomeException) -> FILE_IO) <$> try (mapM_ removeServerFile path)
   st <- asks fileStore
   path' <- ExceptT $ liftIO $ storeAction st
   lift $ incFileStat stat
   forM_ path' $ \p -> do
     us <- asks usedStorage
     atomically $ modifyTVar' us $ subtract (fromIntegral $ size fileInfo)
-    when (path /= Just p) $ lift $ removeServerFile stats p `catch` \(e :: SomeException) -> logError $ "failed to remove file " <> tshow p <> ": " <> tshow e
+    stats <- asks serverStats
+    liftIO $ atomicModifyIORef'_ (filesCount stats) (subtract 1)
+    liftIO $ atomicModifyIORef'_ (filesSize stats) (subtract $ fromIntegral $ size fileInfo)
+    lift $ removeServerFile p `catch` \(e :: SomeException) -> logError $ "failed to remove file " <> tshow p <> ": " <> tshow e
   where
-    removeServerFile stats p = (removeFile p >> deletedStats stats) `catch` \e -> unless (isDoesNotExistError e) $ throwIO e
-    deletedStats stats = do
-      liftIO $ atomicModifyIORef'_ (filesCount stats) (subtract 1)
-      liftIO $ atomicModifyIORef'_ (filesSize stats) (subtract $ fromIntegral $ size fileInfo)
+    removeServerFile p = removeFile p `catch` \e -> unless (isDoesNotExistError e) $ throwIO e
 
 entitlementValid :: SystemSeconds -> SystemSeconds -> Bool
 entitlementValid now expiresAt = roundedSeconds expiresAt + 86400 > roundedSeconds now
@@ -718,10 +720,10 @@ expireServerFiles itemDelay expCfg = do
       let sIds = map (\(sId, _, _) -> sId) expired
       unless (null sIds) $ do
         deleted <- M.fromList <$> liftIO (deleteFiles st sIds)
-        forM_ expired $ \(sId, filePath_, fileSize) ->
+        forM_ expired $ \(sId, _, fileSize) ->
           forM_ (M.lookup sId deleted) $ \path -> do
             forM_ path $ \fp -> do
-              when (filePath_ /= Just fp) $ removeExpiredFile fp
+              removeExpiredFile fp
               atomically $ modifyTVar' us $ subtract (fromIntegral fileSize)
             incFileStat filesExpired
         withFileLog $ \sl -> mapM_ (logDeleteFile sl) (M.keys deleted)
