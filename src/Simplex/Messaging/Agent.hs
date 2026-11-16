@@ -2321,7 +2321,7 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
             withStore' c (\db -> deleteMsg db connId msgId >> deleteCommand db cmdId)
             pure t_
         ICAck rId srvMsgId -> withServer $ \srv ->
-          tryCommand $ withConnLockNotify c connId "ICAck" $ ack srv rId srvMsgId
+          threadDelay 300000 >> tryCommand (withConnLockNotify c connId "ICAck" $ ack srv rId srvMsgId)
         ICAllowSecure _rId senderKey -> withServer' . tryMoveableWithLock "ICAllowSecure" $ do
           (SomeConn _ conn, AcceptedConfirmation {senderConf, ownConnInfo}) <-
             withStore c $ \db -> runExceptT $ (,) <$> ExceptT (getConn db connId) <*> ExceptT (getAcceptedConfirmation db connId)

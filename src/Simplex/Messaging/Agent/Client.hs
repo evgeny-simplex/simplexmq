@@ -326,6 +326,7 @@ import System.Random (randomR)
 import UnliftIO (mapConcurrently, timeout)
 import UnliftIO.Async (async)
 import UnliftIO.Concurrent (forkIO, mkWeakThreadId)
+import qualified UnliftIO.Concurrent
 import UnliftIO.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import qualified UnliftIO.Exception as E
 import UnliftIO.STM
@@ -1741,6 +1742,7 @@ subscribeSessQueues_ c withEvents qs = sendClientBatch_ "SUB" False subscribe_ c
       forM_ cs_ $ \cs -> do
         let (errs, okConns) = partitionEithers $ map (\(RcvQueueSub {connId}, r) -> bimap (connId,) (const connId) r) $ L.toList rs
             conns = filter (`S.notMember` cs) okConns
+        UnliftIO.Concurrent.threadDelay 300000
         unless (null conns) $ notifySub c $ UP srv conns
         forM_ (L.nonEmpty errs) $ \errs' -> do
           let noFinalErrs = all (temporaryClientError . snd) errs'

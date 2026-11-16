@@ -652,7 +652,7 @@ getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qS
             writeTVar (connected c) True
             putTMVar cVar $ Right c'
           raceAny_ ([send c' th, process c', receive c' th] <> [monitor c' | smpPingInterval > 0])
-            `E.finally` (failPendingRequests c >> disconnected c')
+            `E.finally` (threadDelay' 300000 >> failPendingRequests c >> disconnected c')
 
     failPendingRequests :: PClient v err msg -> IO ()
     failPendingRequests PClient {sentCommands} = atomically $ swapTVar sentCommands mempty >>= mapM_ failRequest
