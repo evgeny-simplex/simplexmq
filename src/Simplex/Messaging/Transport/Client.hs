@@ -54,6 +54,7 @@ import Network.Socket
 import Network.Socks5
 import qualified Network.TLS as T
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (parseAll, parseString)
@@ -174,16 +175,23 @@ runTLSTransportClient tlsParams caStore_ cfg@TransportClientConfig {socksProxy, 
         _ -> connectTCPClient hostName
   h <- newIORef Nothing
   let set hc = (>>= \c -> writeIORef h (Just $ hc c) $> c)
+  diagPort port "T connecting"
   E.bracket (set CHSocket $ connectTCP port) (\_ -> closeConn h) $ \sock -> do
-    mapM_ (setSocketKeepAlive sock) tcpKeepAlive `E.catchAny` \e -> logError ("Error setting TCP keep-alive " <> tshow e)
+    diagPort port "T tcp connected"
+    mapM_ (setSocketKeepAlive sock) tcpKeepAlive `E.catchAny` \e -> diagPort port ("T keep-alive error " <> show e) >> logError ("Error setting TCP keep-alive " <> tshow e)
+    diagPort port "T keep-alive set, starting TLS"
     let tCfg = clientTransportConfig cfg
     -- No TLS timeout to avoid failing connections via SOCKS
-    tls <- set CHContext $ connectTLS (Just hostName) tCfg clientParams sock
+    tls <- set CHContext (connectTLS (Just hostName) tCfg clientParams sock) `E.withException` \(e :: E.SomeException) -> diagPort port ("T TLS exception " <> show e)
     chain <- takePeerCertChain serverCert
     sent <- readIORef clientCredsSent
     client =<< set CHTransport (getTransportConnection tCfg sent chain tls)
   where
-    closeConn = readIORef >=> mapM_ (\c -> E.uninterruptibleMask_ $ closeConn_ c `catchAll_` pure ())
+    closeConn = readIORef >=> \h_ -> diagPort port ("T closing " <> maybe "nothing" handleKind h_) >> mapM_ (\c -> E.uninterruptibleMask_ $ closeConn_ c `catchAll_` pure ()) h_ >> diagPort port "T closed"
+    handleKind = \case
+      CHSocket _ -> "socket"
+      CHContext _ -> "context"
+      CHTransport _ -> "transport"
     closeConn_ = \case
       CHSocket sock -> close sock
       CHContext tls -> closeTLS tls

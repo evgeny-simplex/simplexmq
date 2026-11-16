@@ -39,6 +39,7 @@ import Network.Socks5 (SocksCredentials)
 import qualified Network.TLS as T
 import Numeric.Natural (Natural)
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Protocol (NetworkError (..), toNetworkError)
 import Simplex.Messaging.Transport (ALPN, STransportPeer (..), SessionId, TLS (tlsALPN, tlsPeerCert, tlsUniq), TransportPeer (..), TransportPeerI (..), getServerVerifyKey)
@@ -146,7 +147,7 @@ getVerifiedHTTP2ClientWith config host port disconnected setup =
         async $ restore (setup (client c cVar)) `E.catch` \e -> do
           void $ atomically $ tryPutTMVar cVar $ Left $ HCNetworkError $ toNetworkError e
           E.throwIO e
-      c_ <- restore (connTimeout config `timeout` atomically (takeTMVar cVar)) `E.onException` cancel action
+      c_ <- restore (connTimeout config `timeout` atomically (takeTMVar cVar)) `E.onException` (diagPort port "H2 cancelling action" >> cancel action >> diagPort port "H2 action cancelled")
       case c_ of
         Just (Right c') -> pure $ Right c' {action = Just action}
         Just (Left e) -> pure $ Left e

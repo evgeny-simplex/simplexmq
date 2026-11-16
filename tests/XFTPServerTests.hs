@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -26,7 +27,7 @@ import qualified Data.CaseInsensitive as CI
 import Data.Either (isLeft)
 import Data.List (find, isInfixOf)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Time.Clock (getCurrentTime)
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Data.X509 as X
 import Data.X509.Validation (Fingerprint (..), getFingerprint)
 import Network.HPACK.Token (tokenKey)
@@ -43,6 +44,7 @@ import Simplex.FileTransfer.Transport (XFTPClientHandshake (..), XFTPClientHello
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientError (..), defaultNetworkConfig)
 import qualified Simplex.Messaging.Crypto as C
 import qualified Simplex.Messaging.Crypto.Lazy as LC
+import Simplex.Messaging.Diag (diagPort, withDiagTest)
 import Simplex.Messaging.Encoding (smpDecode, smpEncode)
 import Simplex.Messaging.Protocol (BasicAuth, EntityId (..), RecipientId, SenderId, pattern NoEntity)
 import Simplex.Messaging.Server.Expiration (ExpirationConfig (..))
@@ -74,6 +76,8 @@ xftpServerTests = do
       it "should expire chunks after set interval" testFileChunkExpiration
       it "should disconnect inactive clients" testInactiveClientExpiration
       it "should close connection when connecting client is cancelled" $ \_ -> testCancelledClientConnect
+      describe "diag xftp-cancel copies" $ forM_ ([1 .. 10] :: [Int]) $ \i ->
+        it ("diag xftp-cancel " <> show i) $ \_ -> testCancelledClientConnect
       it "should not allow uploading chunks after specified storage quota" testFileStorageQuota
       it "should release storage of interrupted uploads" testInterruptedUploadStorage
       it "should store file records to log and restore them after server restart" testFileLog
@@ -248,12 +252,19 @@ testInactiveClientExpiration fsType = withXFTPServerConfigOn (updateXFTPCfg (cfg
 
 testCancelledClientConnect :: HasTestEnv => Expectation
 testCancelledClientConnect =
-  withStallingServerOn' xftpTestPort $ \accepted closed -> replicateM_ 1000 $ do
-    ts <- getCurrentTime
-    a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
-    timeout 5000000 (atomically $ takeTMVar accepted) `shouldReturn` Just ()
-    timeout 5000000 (cancel a) `shouldReturn` Just ()
-    timeout 1000000 (atomically $ takeTMVar closed) `shouldReturn` Just ()
+  withStallingServerOn' xftpTestPort $ \accepted closed -> forM_ ([1 .. 1000] :: [Int]) $ \i ->
+    withDiagTest (testNo ?testEnv) [xftpTestPort] ("iteration " <> show i) $ do
+      ts <- getCurrentTime
+      a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
+      timeout 5000000 (atomically $ takeTMVar accepted) `shouldReturn` Just ()
+      diagPort xftpTestPort "test: accepted taken, cancelling"
+      timeout 5000000 (cancel a) `shouldReturn` Just ()
+      diagPort xftpTestPort "test: cancelled"
+      t0 <- getCurrentTime
+      r <- timeout 30000000 (atomically $ takeTMVar closed)
+      t1 <- getCurrentTime
+      diagPort xftpTestPort $ "test: closed " <> show r <> " after " <> show (diffUTCTime t1 t0)
+      (r, diffUTCTime t1 t0 < 1) `shouldBe` (Just (), True)
 
 testFileStorageQuota :: HasTestEnv => AFStoreType -> Expectation
 testFileStorageQuota fsType = withXFTPServerConfigOn (updateXFTPCfg (cfgFS fsType) $ \c -> c {fileSizeQuota = Just $ chSize * 2}) $

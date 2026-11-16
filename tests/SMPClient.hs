@@ -30,6 +30,7 @@ import Simplex.Messaging.Agent.Store.Shared (MigrationConfirmation (..))
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientConfig (..), chooseTransportHost, defaultNetworkConfig)
 import Simplex.Messaging.Client.Agent (SMPClientAgentConfig (..), defaultSMPClientAgentConfig)
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Protocol
 import Simplex.Messaging.Server (runSMPServerBlocking)
@@ -418,12 +419,17 @@ withStallingServerOn' :: HasCallStack => ServiceName -> (TMVar () -> TMVar () ->
 withStallingServerOn' port action = do
   accepted <- newEmptyTMVarIO
   closed <- newEmptyTMVarIO
-  let waitClosed sock = unlessM (B.null <$> recv sock 4096) $ waitClosed sock
+  let waitClosed sock = do
+        s <- recv sock 4096
+        diagPort port $ "SH recv " <> show (B.length s)
+        unless (B.null s) $ waitClosed sock
   serverBracket
     (\started -> runLocalTCPServer started port $ \sock -> do
+        diagPort port "SH accepted"
         void $ atomically $ tryPutTMVar accepted ()
-        waitClosed sock
-        void $ atomically $ tryPutTMVar closed ())
+        waitClosed sock `E.withException` \(e :: E.SomeException) -> diagPort port ("SH exception " <> show e)
+        void $ atomically $ tryPutTMVar closed ()
+        diagPort port "SH closed put")
     (pure ())
     (const $ action accepted closed)
 
