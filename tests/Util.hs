@@ -21,6 +21,7 @@ import GHC.Conc (getNumCapabilities, getNumProcessors, setNumCapabilities)
 import GHC.IO.Exception (IOException (..))
 import qualified GHC.IO.Exception as IOException
 import Network.Socket (ServiceName)
+import Simplex.Messaging.Diag (diagLog, withDiagPorts)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive, removeFile)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
@@ -152,6 +153,16 @@ instance Example a => Example (TestWrapper a) where
 
 envCI :: IO Bool
 envCI = (Just "true" ==) <$> lookupEnv "CI"
+
+diagCopy :: HasTestEnv => String -> IO a -> IO a
+diagCopy name action = do
+  let TestEnv {testNo, portBase} = ?testEnv
+      tag = "COPY " <> name <> " T" <> show testNo <> " ports " <> show portBase
+  withDiagPorts testNo (map show [portBase .. portBase + 9]) $ do
+    diagLog $ tag <> " start"
+    r <- E.try action
+    diagLog $ tag <> either (\(e :: SomeException) -> " FAILED " <> show e) (const " ok") r
+    either E.throwIO pure r
 
 it :: (HasCallStack, Example a) => String -> (HasTestEnv => a) -> SpecWith (Arg a)
 it label action = Hspec.it label (TestWrapper label action)

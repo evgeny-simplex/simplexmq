@@ -30,6 +30,7 @@ import Simplex.Messaging.Agent.Store.Shared (MigrationConfirmation (..))
 import Simplex.Messaging.Client (NetworkConfig (..), NetworkTimeout (..), ProtocolClientConfig (..), chooseTransportHost, defaultNetworkConfig)
 import Simplex.Messaging.Client.Agent (SMPClientAgentConfig (..), defaultSMPClientAgentConfig)
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Protocol
 import Simplex.Messaging.Server (runSMPServerBlocking)
@@ -377,10 +378,13 @@ withServerCfg :: AServerConfig -> (forall s. ServerConfig s -> a) -> a
 withServerCfg (ASrvCfg _ _ cfg') f = f cfg'
 
 withSmpServerConfigOn :: HasCallStack => ASrvTransport -> AServerConfig -> ServiceName -> (HasCallStack => ThreadId -> IO a) -> IO a
-withSmpServerConfigOn t (ASrvCfg _ _ cfg') port' =
+withSmpServerConfigOn t (ASrvCfg _ _ cfg') port' f = do
+  diagPort port' "SRV starting"
   serverBracket
     (\started -> runSMPServerBlocking started cfg' {transports = [(port', t, False)]} Nothing)
-    (threadDelay 10000)
+    (diagPort port' "SRV stop requested" >> threadDelay 10000)
+    (\tId -> diagPort port' "SRV started" >> f tId)
+    `E.finally` diagPort port' "SRV stopped"
 
 withSmpServerThreadOn :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> ServiceName -> (HasCallStack => ThreadId -> IO a) -> IO a
 withSmpServerThreadOn (t, msType) = withSmpServerConfigOn t (cfgMS msType)

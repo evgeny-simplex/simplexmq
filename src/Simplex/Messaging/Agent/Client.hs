@@ -260,6 +260,7 @@ import Simplex.Messaging.Client
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.BBS (BBSPresHeader (..), BBSPublicKey)
 import Simplex.Messaging.Crypto.Entitlement (EntitlementCredential, EntitlementProof, generateEntitlementProof)
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Notifications.Client
@@ -774,6 +775,7 @@ smpConnectClient c@AgentClient {smpClients, msgQ, proxySessTs, presetDomains} nm
       smp <- liftError (protocolClientError SMP $ B.unpack $ strEncode srv) $ do
         ts <- readTVarIO proxySessTs
         ExceptT $ getProtocolClient g nm tSess cfg' presetDomains (Just msgQ) ts $ smpClientDisconnected c tSess env v' prs
+      diagSrv srv $ "A" <> show (clientId c) <> " connected sess=" <> B.unpack (B.take 6 $ B64.encode $ sessionId $ thParams smp)
       atomically $ SS.setSessionId tSess (sessionId $ thParams smp) $ currentSubs c
       updateClientService service smp
       pure SMPConnectedClient {connectedClient = smp, proxiedRelays = prs}
@@ -787,6 +789,7 @@ smpConnectClient c@AgentClient {smpClients, msgQ, proxySessTs, presetDomains} nm
 
 smpClientDisconnected :: AgentClient -> SMPTransportSession -> Env -> SMPClientVar -> TMap SMPServer ProxiedRelayVar -> SMPClient -> IO ()
 smpClientDisconnected c@AgentClient {active, smpClients, smpProxiedRelays} tSess@(userId, srv, cId) env v prs client = do
+  diagSrv srv $ "A" <> show (clientId c) <> " disconnected sess=" <> B.unpack (B.take 6 $ B64.encode $ sessionId $ thParams client)
   removeClientAndSubs >>= serverDown
   logInfo . decodeUtf8 $ "Agent disconnected from " <> showServer srv
   where
@@ -1661,6 +1664,7 @@ subscribeQueues_ c withEvents qs'@(tSess@(_, srv, _), _) = do
   if active
     then when (hasTempErrors rs) resubscribe $> rs
     else do
+      diagSrv srv $ "A" <> show (clientId c) <> " sub batch result for replaced client"
       logWarn "subcription batch result for replaced SMP client, resubscribing"
       -- we use BROKER NETWORK error here instead of the original error, so it becomes temporary.
       resubscribe $> L.map (second $ Left . toNESubscribeError) rs
@@ -1861,8 +1865,11 @@ sendClientBatch_ statCmd errRes action c nm (tSess@(_, srv, _), qs') =
   tryAllErrors' (getSMPServerClient c nm tSess) >>= \case
     Left e -> pure (L.map (,Left e) qs', errRes)
     Right (SMPConnectedClient smp _) -> liftIO $ do
+      diagSrv srv $ "A" <> show (clientId c) <> " batch " <> B.unpack statCmd <> " sess=" <> B.unpack (B.take 6 $ B64.encode $ sessionId $ thParams smp)
       logServer' "-->" c srv (bshow (length qs') <> " queues") statCmd
-      first (L.map agentError) <$> action smp qs'
+      r <- first (L.map agentError) <$> action smp qs'
+      diagSrv srv $ "A" <> show (clientId c) <> " batch " <> B.unpack statCmd <> " results " <> show (L.map (either show (const "OK") . snd) (fst r))
+      pure r
       where
         agentError = second . first $ protocolClientError SMP $ B.unpack (strEncode srv)
 
@@ -1938,8 +1945,12 @@ logServer dir c srv = logServer' dir c srv . unEntityId
 {-# INLINE logServer #-}
 
 logServer' :: MonadIO m => ByteString -> AgentClient -> ProtocolServer s -> ByteString -> ByteString -> m ()
-logServer' dir AgentClient {clientId} srv qStr cmdStr =
+logServer' dir AgentClient {clientId} srv qStr cmdStr = do
+  diagSrv srv $ B.unpack $ B.unwords ["A" <> bshow clientId, dir, showServer srv, ":", logSecret' qStr, cmdStr]
   logInfo . decodeUtf8 $ B.unwords ["A", "(" <> bshow clientId <> ")", dir, showServer srv, ":", logSecret' qStr, cmdStr]
+
+diagSrv :: MonadIO m => ProtocolServer s -> String -> m ()
+diagSrv ProtocolServer {port = p} = diagPort p
 
 showServer :: ProtocolServer s -> ByteString
 showServer ProtocolServer {host, port} =

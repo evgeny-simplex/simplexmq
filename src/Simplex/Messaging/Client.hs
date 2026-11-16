@@ -161,6 +161,7 @@ import Network.Socket (HostName, ServiceName)
 import Network.Socks5 (SocksCredentials (..))
 import Numeric.Natural
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (defaultJSON, dropPrefix, enumJSON, sumTypeJSON)
@@ -651,11 +652,18 @@ getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qS
           atomically $ do
             writeTVar (connected c) True
             putTMVar cVar $ Right c'
-          raceAny_ ([send c' th, process c', receive c' th] <> [monitor c' | smpPingInterval > 0])
+          let sessStr = case params of THandleParams {sessionId = s} -> B.unpack (B.take 6 $ B64.encode s)
+          diagC $ "C connected sess=" <> sessStr
+          (raceAny_ ([send c' th, process c', receive c' th] <> [monitor c' | smpPingInterval > 0]) `E.catch` \(e :: SomeException) -> diagC ("C conn ended sess=" <> sessStr <> " " <> show e) >> E.throwIO e)
             `E.finally` (failPendingRequests c >> disconnected c')
 
+    diagC :: String -> IO ()
+    diagC = let ProtocolServer {port = p} = srv in diagPort p
+
     failPendingRequests :: PClient v err msg -> IO ()
-    failPendingRequests PClient {sentCommands} = atomically $ swapTVar sentCommands mempty >>= mapM_ failRequest
+    failPendingRequests PClient {sentCommands} = do
+      n <- atomically $ swapTVar sentCommands mempty >>= \cs -> length cs <$ mapM_ failRequest cs
+      diagC $ "C failed pending " <> show n
       where
         failRequest Request {pending, responseVar} =
           whenM (swapTVar pending False) $ void $ tryPutTMVar responseVar $ Left $ PCENetworkError NEFailedError

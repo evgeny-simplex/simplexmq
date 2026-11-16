@@ -175,6 +175,7 @@ import Data.Aeson (FromJSON (..), ToJSON (..))
 import qualified Data.Aeson as J
 import qualified Data.Aeson.TH as JQ
 import Data.Bifunctor (bimap, first)
+import qualified Data.ByteString.Base64 as B64
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import Data.Composition
@@ -227,6 +228,7 @@ import Simplex.Messaging.Crypto.File (CryptoFile, CryptoFileArgs)
 import Simplex.Messaging.Crypto.Ratchet (PQEncryption, PQSupport (..), pattern PQEncOff, pattern PQEncOn, pattern PQSupportOff, pattern PQSupportOn)
 import qualified Simplex.Messaging.Crypto.Ratchet as CR
 import qualified Simplex.Messaging.Crypto.ShortLink as SL
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Notifications.Protocol (DeviceToken, NtfRegCode (NtfRegCode), NtfTknStatus (..), NtfTokenId, PNMessageData (..), pnMessagesP)
@@ -2220,7 +2222,11 @@ sendMessagesB_ c reqs connIds = withConnLocks c connIds "sendMessages" $ do
 enqueueCommand :: AgentClient -> ACorrId -> ConnId -> Maybe SMPServer -> AgentCommand -> AM ()
 enqueueCommand c corrId connId server aCommand = do
   withStore c $ \db -> createCommand db corrId connId server aCommand
+  forM_ server $ \srv -> diagCmdSrv c srv connId $ "enqueue " <> show (agentCommandTag aCommand)
   lift . void $ getAsyncCmdWorker True c connId server
+
+diagCmdSrv :: MonadIO m => AgentClient -> SMPServer -> ConnId -> String -> m ()
+diagCmdSrv c ProtocolServer {port = p} connId s = diagPort p $ "A" <> show (clientId c) <> " conn " <> B.unpack (B.take 4 $ B64.encode connId) <> " " <> s
 
 resumeSrvCmds :: AgentClient -> ConnId -> Maybe SMPServer -> AM' ()
 resumeSrvCmds = void .:. getAsyncCmdWorker False
@@ -2459,7 +2465,11 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
         tryMoveableCommand action = withRetryInterval2 ri $ \_ loop -> do
           liftIO $ waitWhileSuspended c
           liftIO $ waitForUserNetwork c
-          tryAllErrors action >>= \case
+          let diagCmd s = forM_ server_ $ \srv -> diagCmdSrv c srv connId $ "cmd " <> show (agentCommandTag command) <> " " <> s
+          diagCmd "start"
+          r <- tryAllErrors action
+          diagCmd $ either (("error " <>) . show) (const "done") r
+          pure r >>= \case
             Left e@(SMP _ SMP.QUOTA) -> do
               AgentConfig {quotaExceededTimeout} <- asks config
               expireTs <- addUTCTime (-quotaExceededTimeout) <$> liftIO getCurrentTime

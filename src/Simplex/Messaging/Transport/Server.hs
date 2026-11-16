@@ -49,6 +49,7 @@ import Foreign.C.Error
 import GHC.IO.Exception (ioe_errno)
 import Network.Socket
 import qualified Network.TLS as T
+import Simplex.Messaging.Diag (diagPort, diagSockPort)
 import Simplex.Messaging.Transport
 import Simplex.Messaging.Transport.Shared
 import Simplex.Messaging.Util (catchAll_, labelMyThread, stateTVar', tshow, unlessM)
@@ -176,11 +177,15 @@ runTCPServerSocket (accepted, gracefullyClosed, clients) started getSocket serve
   E.bracket getSocket (closeServer started clients) $ \sock ->
     forever . E.bracketOnError (safeAccept sock) (close . fst) $ \(conn, _peer) -> do
       cId <- atomically $ stateTVar' accepted $ \cId -> let cId' = cId + 1 in (cId', cId')
+      p <- diagSockPort conn
+      diagPort p $ "S accepted " <> show cId
       closed <- newTVarIO False
-      let closeConn _ = do
+      let closeConn r = do
+            diagPort p $ "S conn " <> show cId <> " ended " <> either show (const "ok") r
             atomically $ writeTVar closed True >> modifyTVar' clients (IM.delete cId)
             gracefulClose conn 5000 `catchAll_` pure () -- catchAll_ is needed here in case the connection was closed earlier
             atomically $ modifyTVar' gracefullyClosed (+ 1)
+            diagPort p $ "S conn " <> show cId <> " closed"
       tId <- mkWeakThreadId =<< server conn `forkFinally` closeConn
       atomically $ unlessM (readTVar closed) $ modifyTVar' clients $ IM.insert cId tId
 
@@ -229,8 +234,12 @@ getSocketStats (accepted, closed, active) = do
 
 closeServer :: TMVar Bool -> TVar (IntMap (Weak ThreadId)) -> Socket -> IO ()
 closeServer started clients sock = do
+  p <- diagSockPort sock
+  n <- IM.size <$> readTVarIO clients
+  diagPort p $ "S closing server, clients " <> show n
   close sock
   readTVarIO clients >>= mapM_ (deRefWeak >=> mapM_ killThread)
+  diagPort p "S clients killed"
   void . atomically $ tryPutTMVar started False
 
 startTCPServer :: TMVar Bool -> Maybe HostName -> ServiceName -> IO Socket

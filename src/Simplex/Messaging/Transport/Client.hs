@@ -54,6 +54,7 @@ import Network.Socket
 import Network.Socks5
 import qualified Network.TLS as T
 import qualified Simplex.Messaging.Crypto as C
+import Simplex.Messaging.Diag (diagPort)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (parseAll, parseString)
@@ -175,7 +176,8 @@ runTLSTransportClient tlsParams caStore_ cfg@TransportClientConfig {socksProxy, 
   h <- newIORef Nothing
   let set hc = (>>= \c -> writeIORef h (Just $ hc c) $> c)
   E.bracket (set CHSocket $ connectTCP port) (\_ -> closeConn h) $ \sock -> do
-    mapM_ (setSocketKeepAlive sock) tcpKeepAlive `catchAll` \e -> logError ("Error setting TCP keep-alive " <> tshow e)
+    mapM_ (setSocketKeepAlive sock) tcpKeepAlive `catchAll` \e -> diagPort port ("T keep-alive handler caught " <> show e) >> logError ("Error setting TCP keep-alive " <> tshow e)
+    diagPort port "T keep-alive set, starting TLS"
     let tCfg = clientTransportConfig cfg
     -- No TLS timeout to avoid failing connections via SOCKS
     tls <- set CHContext $ connectTLS (Just hostName) tCfg clientParams sock

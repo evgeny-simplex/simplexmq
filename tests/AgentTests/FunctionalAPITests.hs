@@ -110,6 +110,7 @@ import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFile (..))
 import Simplex.Messaging.Crypto.Ratchet (InitialKeys (..), PQEncryption (..), PQSupport (..), pattern IKPQOff, pattern IKPQOn, pattern PQEncOff, pattern PQEncOn, pattern PQSupportOff, pattern PQSupportOn)
 import qualified Simplex.Messaging.Crypto.Ratchet as CR
+import Simplex.Messaging.Diag (diagAgentTag, diagLog, registerDiagAgent)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Protocol (BasicAuth, ErrorType (..), MsgBody, NetworkError (..), ProtocolServer (..), SubscriptionMode (..), supportedSMPClientVRange)
@@ -201,6 +202,7 @@ pGet c = pGet' c True
 pGet' :: forall m. MonadIO m => AgentClient -> Bool -> m ATransmission
 pGet' c skipWarn = do
   t@(_, _, AEvt _ cmd) <- atomically (readTBQueue $ subQ c)
+  liftIO $ diagAgentTag c >>= mapM_ (\tag -> diagLog $ tag <> " EV " <> take 300 (show t))
   case cmd of
     CONNECT {} -> pGet c
     DISCONNECT {} -> pGet c
@@ -451,6 +453,10 @@ functionalAPITests ps = do
       it "should get 1-time link data after restart" $ testInvitationShortLinkRestart ps
       it "should connect via contact short link after restart" $ testContactShortLinkRestart ps
       it "should connect via added contact short link after restart" $ testAddContactShortLinkRestart ps
+      describe "diag copies" $ forM_ [1 .. 40 :: Int] $ \i -> do
+        it ("diag inv-restart " <> show i) $ diagCopy "inv-restart" $ testInvitationShortLinkRestart ps
+        it ("diag ct-restart " <> show i) $ diagCopy "ct-restart" $ testContactShortLinkRestart ps
+        it ("diag addct-restart " <> show i) $ diagCopy "addct-restart" $ testAddContactShortLinkRestart ps
     it "should create and get short links with the old contact queues" $ testOldContactQueueShortLink ps
     it "should connect via prepared connection link" $ testPrepareCreateConnectionLink ps
     it "should connect via prepared invitation link" $ testPrepareCreateInvitationLink ps
@@ -559,6 +565,8 @@ functionalAPITests ps = do
       testDeleteConnectionAsync ps
     it "join connection when reply queue creation fails" $
       testJoinConnectionAsyncReplyError ps
+    describe "diag reply-queue copies" $ forM_ [1 .. 40 :: Int] $ \i ->
+      it ("diag reply-queue " <> show i) $ diagCopy "reply-queue" $ testJoinConnectionAsyncReplyError ps
     describe "delete connection waiting for delivery" $ do
       it "should delete connection immediately if there are no pending messages" $
         testWaitDeliveryNoPending ps
@@ -4295,7 +4303,7 @@ testSwitchAsync servers = do
     withB = withAgent 2 agentCfgV7 servers testDB2
 
 withAgent :: HasCallStack => Int -> AgentConfig -> InitialAgentServers -> String -> (HasCallStack => AgentClient -> IO a) -> IO a
-withAgent clientId cfg' servers dbPath = bracket (getSMPAgentClient' clientId cfg' servers dbPath) (\a -> disposeAgentClient a >> threadDelay 100000)
+withAgent clientId cfg' servers dbPath = bracket (getSMPAgentClient' clientId cfg' servers dbPath >>= \a -> a <$ registerDiagAgent a clientId dbPath) (\a -> disposeAgentClient a >> threadDelay 100000)
 
 sessionSubscribe :: (forall a. (AgentClient -> IO a) -> IO a) -> [ConnId] -> (AgentClient -> ExceptT AgentErrorType IO ()) -> IO ()
 sessionSubscribe withC connIds a =
