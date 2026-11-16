@@ -152,7 +152,7 @@ smpProxyTests = do
           agentViaProxyRetryOffline
         it "retries sending when destination relay session disconnects in proxy" $ \_ ->
           agentViaProxyRetryNoSession
-        describe "diag copies" $ forM_ [1 .. 40 :: Int] $ \i -> do
+        describe "diag copies" $ forM_ ([1 .. 60] :: [Int]) $ \i -> do
           it ("diag relay-offline " <> show i) $ \_ -> diagCopy "relay-offline" agentViaProxyRetryOffline
           it ("diag via-proxy-one " <> show i) $ \msType -> diagCopy "via-proxy-one" $
             oneServer (agentDeliverMessageViaProxy ([srv1], SPMAlways, True) ([srv1], SPMAlways, True) C.SEd448 "hello 1" "hello 2" 1) msType

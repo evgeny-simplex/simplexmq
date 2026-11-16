@@ -173,7 +173,7 @@ notificationTests ps@(t, _) = do
     testServerMatrix2 ps $ \servers ->
       withAPNSMockServer $ \apns ->
         withNtfServer t $ testSwitchNotifications agentCfgV7 switchComplete servers apns
-  describe "diag slow rotation copies" $ forM_ [1 .. 40 :: Int] $ \i ->
+  describe "diag slow rotation copies" $ forM_ ([1 .. 40] :: [Int]) $ \i ->
     it ("diag slow-rotation " <> show i) $ diagCopy "slow-rotation" $
       withSmpServers2 ps $ withAPNSMockServer $ \apns ->
         withNtfServer t $ testSwitchNotifications agentCfgV7 switchComplete initAgentServers2 apns

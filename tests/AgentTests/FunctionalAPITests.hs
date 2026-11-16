@@ -110,7 +110,7 @@ import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFile (..))
 import Simplex.Messaging.Crypto.Ratchet (InitialKeys (..), PQEncryption (..), PQSupport (..), pattern IKPQOff, pattern IKPQOn, pattern PQEncOff, pattern PQEncOn, pattern PQSupportOff, pattern PQSupportOn)
 import qualified Simplex.Messaging.Crypto.Ratchet as CR
-import Simplex.Messaging.Diag (diagAgentTag, diagLog, registerDiagAgent)
+import Simplex.Messaging.Diag (diagAgentLog, registerDiagAgent)
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Protocol (BasicAuth, ErrorType (..), MsgBody, NetworkError (..), ProtocolServer (..), SubscriptionMode (..), supportedSMPClientVRange)
@@ -202,7 +202,7 @@ pGet c = pGet' c True
 pGet' :: forall m. MonadIO m => AgentClient -> Bool -> m ATransmission
 pGet' c skipWarn = do
   t@(_, _, AEvt _ cmd) <- atomically (readTBQueue $ subQ c)
-  liftIO $ diagAgentTag c >>= mapM_ (\tag -> diagLog $ tag <> " EV " <> take 300 (show t))
+  liftIO $ diagAgentLog c $ "EV " <> take 300 (show t)
   case cmd of
     CONNECT {} -> pGet c
     DISCONNECT {} -> pGet c
@@ -453,7 +453,7 @@ functionalAPITests ps = do
       it "should get 1-time link data after restart" $ testInvitationShortLinkRestart ps
       it "should connect via contact short link after restart" $ testContactShortLinkRestart ps
       it "should connect via added contact short link after restart" $ testAddContactShortLinkRestart ps
-      describe "diag copies" $ forM_ [1 .. 40 :: Int] $ \i -> do
+      describe "diag copies" $ forM_ ([1 .. 40] :: [Int]) $ \i -> do
         it ("diag inv-restart " <> show i) $ diagCopy "inv-restart" $ testInvitationShortLinkRestart ps
         it ("diag ct-restart " <> show i) $ diagCopy "ct-restart" $ testContactShortLinkRestart ps
         it ("diag addct-restart " <> show i) $ diagCopy "addct-restart" $ testAddContactShortLinkRestart ps
@@ -565,7 +565,7 @@ functionalAPITests ps = do
       testDeleteConnectionAsync ps
     it "join connection when reply queue creation fails" $
       testJoinConnectionAsyncReplyError ps
-    describe "diag reply-queue copies" $ forM_ [1 .. 40 :: Int] $ \i ->
+    describe "diag reply-queue copies" $ forM_ ([1 .. 60] :: [Int]) $ \i ->
       it ("diag reply-queue " <> show i) $ diagCopy "reply-queue" $ testJoinConnectionAsyncReplyError ps
     describe "delete connection waiting for delivery" $ do
       it "should delete connection immediately if there are no pending messages" $

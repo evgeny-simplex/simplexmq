@@ -74,8 +74,6 @@ xftpServerTests = do
       it "should expire chunks after set interval" testFileChunkExpiration
       it "should disconnect inactive clients" testInactiveClientExpiration
       it "should close connection when connecting client is cancelled" $ \_ -> testCancelledClientConnect
-      describe "diag copies" $ forM_ [1 .. 50 :: Int] $ \i ->
-        it ("diag xftp-cancel " <> show i) $ \_ -> diagCopy "xftp-cancel" testCancelledClientConnectDiag
       it "should not allow uploading chunks after specified storage quota" testFileStorageQuota
       it "should release storage of interrupted uploads" testInterruptedUploadStorage
       it "should store file records to log and restore them after server restart" testFileLog
@@ -255,15 +253,6 @@ testCancelledClientConnect =
     a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
     timeout 5000000 (atomically $ takeTMVar accepted) `shouldReturn` Just ()
     cancel a
-    timeout 1000000 (atomically $ takeTMVar closed) `shouldReturn` Just ()
-
-testCancelledClientConnectDiag :: HasTestEnv => Expectation
-testCancelledClientConnectDiag =
-  withStallingServerOn' xftpTestPort $ \accepted closed -> do
-    ts <- getCurrentTime
-    a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
-    timeout 5000000 (atomically $ takeTMVar accepted) `shouldReturn` Just ()
-    timeout 20000000 (cancel a) `shouldReturn` Just ()
     timeout 1000000 (atomically $ takeTMVar closed) `shouldReturn` Just ()
 
 testFileStorageQuota :: HasTestEnv => AFStoreType -> Expectation
