@@ -386,6 +386,7 @@ data AgentClient = AgentClient
     getMsgLocks :: TMap (SMPServer, SMP.RecipientId) (TMVar ()),
     -- locks to prevent concurrent operations with connection
     connLocks :: TMap ConnId Lock,
+    connLockViolations :: TVar [Text],
     -- locks to prevent concurrent operations with connection request invitations
     invLocks :: TMap ByteString Lock,
     -- lock to prevent concurrency between periodic and async connection deletions
@@ -556,6 +557,7 @@ newAgentClient clientId InitialAgentServers {smp, ntf, xftp, entitlements, netCf
   agentState <- newTVarIO ASForeground
   getMsgLocks <- TM.emptyIO
   connLocks <- TM.emptyIO
+  connLockViolations <- newTVarIO []
   invLocks <- TM.emptyIO
   deleteLock <- createLockIO
   smpSubWorkers <- TM.emptyIO
@@ -602,6 +604,7 @@ newAgentClient clientId InitialAgentServers {smp, ntf, xftp, entitlements, netCf
         agentState,
         getMsgLocks,
         connLocks,
+        connLockViolations,
         invLocks,
         deleteLock,
         smpSubWorkers,

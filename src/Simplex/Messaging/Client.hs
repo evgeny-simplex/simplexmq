@@ -119,7 +119,10 @@ module Simplex.Messaging.Client
     PCTransmission,
     mkTransmission,
     authTransmission,
+    pClientSndQ,
+    pClientSentCommandsCount,
     smpClientStub,
+    sendProtocolCommand_,
 
     -- * For debugging
     TBQueueInfo (..),
@@ -151,10 +154,11 @@ import Data.Int (Int64)
 import Data.List (find, isSuffixOf)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as L
+import qualified Data.Map.Strict as M
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time.Clock (UTCTime (..), diffUTCTime, getCurrentTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime (..), diffUTCTime, getCurrentTime)
 import qualified Data.X509 as X
 import qualified Data.X509.Validation as XV
 import Network.Socket (HostName, ServiceName)
@@ -253,6 +257,12 @@ smpClientStub g sessionId thVersion thAuth = do
               msgQ = Nothing
             }
       }
+
+pClientSndQ :: ProtocolClient v err msg -> TBQueue (Maybe (Request err msg), ByteString)
+pClientSndQ ProtocolClient {client_ = PClient {sndQ}} = sndQ
+
+pClientSentCommandsCount :: ProtocolClient v err msg -> IO Int
+pClientSentCommandsCount ProtocolClient {client_ = PClient {sentCommands}} = M.size <$> readTVarIO sentCommands
 
 type SMPClient = ProtocolClient SMPVersion ErrorType BrokerMsg
 
@@ -476,6 +486,7 @@ data ProtocolClientConfig v = ProtocolClientConfig
     defaultTransport :: (ServiceName, ATransport 'TClient),
     -- | network configuration
     networkConfig :: NetworkConfig,
+    sentCommandsTTL :: NominalDiffTime,
     clientALPN :: Maybe [ALPN],
     serviceCredentials :: Maybe ServiceCredentials,
     -- | client-server protocol version range
@@ -496,6 +507,7 @@ defaultClientConfig clientALPN useSNI serverVRange =
     { qSize = 64,
       defaultTransport = ("443", transport @TLS),
       networkConfig = defaultNetworkConfig,
+      sentCommandsTTL = 15 * 60,
       clientALPN,
       serviceCredentials = Nothing,
       serverVRange,
