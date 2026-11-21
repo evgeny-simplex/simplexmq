@@ -2903,7 +2903,9 @@ requestAndCommit c connId name validate request commit =
 
 ackMessage' :: AgentClient -> Maybe AsyncCmdId -> ConnId -> AgentMsgId -> Maybe MsgReceiptInfo -> AM (Maybe ATransmission)
 ackMessage' c cmdId_ connId msgId rcptInfo_ =
-  join <$> requestAndCommit c connId "ackMessage" markConnUserAck (uncurry $ ackQueueMessage c) recordAck
+  withConnLock c connId "ackMessage" markConnUserAck $>>= \(rq, srvMsgId) -> do
+    drained <- ackQueueMessage c rq srvMsgId
+    withConnLock c connId "ackMessage" $ recordAck drained (rq, srvMsgId)
   where
     recordAck :: Bool -> (RcvQueue, SMP.MsgId) -> AM (Maybe ATransmission)
     recordAck drained (rq, srvMsgId) = do
@@ -2993,8 +2995,7 @@ switchDuplexConnection c nm cmdId_ switchId (DuplexConnection ConnData {connId, 
             (cData,rqs',sqs',rq1,) <$> withStore c (\db -> addConnRcvQueue db connId rq' SMSubscribe)
           _ -> throwE $ INTERNAL "switchConnection: replaced queue not found in connection"
   recordNewQueue c nm connId "switchConnection" tSess q addRcvQueue $ \(cData, rqs', sqs', rq1, rq'') -> do
-    started <- (Just switchId ==) <$> liftIO (TM.lookupIO connId $ rcvSwitches c)
-    when (rcvSwchStatus rq1 /= Just RSSwitchStarted || not started) $ deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: aborted")
+    when (rcvSwchStatus rq1 /= Just RSSwitchStarted) $ deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: aborted")
     when (ratchetSyncSendProhibited cData) $ do
       void $ withStore' c $ \db -> setRcvSwitchStatus db rq1 Nothing
       deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: send prohibited")
@@ -3154,7 +3155,7 @@ prepareDeleteConnections_ getConnections c waitDelivery connIds = do
     unsubNtfConnIds :: NonEmpty ConnId -> AM' ()
     unsubNtfConnIds connIds' = do
       ns <- asks ntfSupervisor
-      liftIO $ nonBlockingWriteTBQueue (ntfSubQ ns) (NSCDeleteSub, connIds')
+      atomically $ writeTBQueue (ntfSubQ ns) (NSCDeleteSub, connIds')
 
 deleteConnQueues :: AgentClient -> NetworkRequestMode -> Bool -> Bool -> [RcvQueue] -> AM' (Map ConnId (Either AgentErrorType ()))
 deleteConnQueues c nm waitDelivery ntf rqs = do
