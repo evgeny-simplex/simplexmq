@@ -2756,15 +2756,11 @@ getConnData deleted' forUpdate db connId' =
           FROM connections
           WHERE conn_id = ? AND deleted = ?
         |]
-          <> (if forUpdate then forUpdateClause else "")
+#if defined(dbPostgres)
+          <> (if forUpdate then " FOR UPDATE" else "")
+#endif
       )
       (connId', BI deleted')
-  where
-    forUpdateClause =
-      " AND deleted_at_wait_delivery IS NULL"
-#if defined(dbPostgres)
-        <> " FOR UPDATE"
-#endif
 
 lockConnForUpdate :: DB.Connection -> ConnId -> IO ()
 lockConnForUpdate db connId = do
