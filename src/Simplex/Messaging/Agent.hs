@@ -2453,7 +2453,7 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
               withStore' c $ \db -> deleteConnRcvQueue db rq' >> deleteCommand db cmdId
               when enableNtfs $ do
                 ns <- asks ntfSupervisor
-                liftIO . whenM (hasInstantNotifications ns) $ nonBlockingWriteTBQueue (ntfSubQ ns) (NSCCreate, [connId])
+                liftIO $ sendNtfSubCommand ns (NSCCreate, [connId])
               let conn' = DuplexConnection cData rqs sqs
               cStats <- connectionStats c conn'
               notify $ SWITCH QDRcv SPCompleted cStats
@@ -2994,7 +2994,7 @@ switchDuplexConnection c nm cmdId_ switchId (DuplexConnection ConnData {connId, 
   recordNewQueue c nm connId "switchConnection" tSess q addRcvQueue $ \(cData, rqs', sqs', rq1, rq'') -> do
     started <- (Just switchId ==) <$> liftIO (TM.lookupIO connId $ rcvSwitches c)
     if rcvSwchStatus rq1 /= Just RSSwitchStarted || not started
-      then Nothing <$ deleteRcvQueueAsync c rq''
+      then deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: aborted")
       else do
         when (ratchetSyncSendProhibited cData) $ do
           void $ withStore' c $ \db -> setRcvSwitchStatus db rq1 Nothing
@@ -3213,10 +3213,7 @@ deleteConnections_ ::
   AM (Map ConnId (Either AgentErrorType ()))
 deleteConnections_ _ _ _ _ _ [] = pure M.empty
 deleteConnections_ getConnections ntf waitDelivery c nm connIds = do
-  (rs, rqs, _) <- ExceptT . withConnLocks c (S.fromList connIds) "deleteConnections" . runExceptT $ do
-    r@(_, _, connIds') <- prepareDeleteConnections_ getConnections c waitDelivery connIds
-    unless waitDelivery . withStore' c $ \db -> forM_ connIds' $ setConnDeleted db False
-    pure r
+  (rs, rqs, _) <- ExceptT . withConnLocks c (S.fromList connIds) "deleteConnections" . runExceptT $ prepareDeleteConnections_ getConnections c waitDelivery connIds
   rcvRs <- lift $ deleteConnQueues c nm waitDelivery ntf rqs
   let rs' = M.union rs rcvRs
   notifyResultError rs'
@@ -4309,7 +4306,7 @@ processSMPTransmissions c@AgentClient {subQ, smpServersStats} (tSess@(userId, sr
                 unless completed $ do
                   when enableNtfs $ do
                     ns <- asks ntfSupervisor
-                    liftIO . whenM (hasInstantNotifications ns) $ nonBlockingWriteTBQueue (ntfSubQ ns) (NSCCreate, [connId])
+                    liftIO $ sendNtfSubCommand ns (NSCCreate, [connId])
                   let conn' = DuplexConnection cData' (keptRq :| keptRqs) sqs
                   cStats <- connectionStats c conn'
                   notify $ SWITCH QDRcv SPCompleted cStats
