@@ -2526,7 +2526,7 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
           liftIO $ noWorkToDo doWork
           otherCmds <- withStore c $ \db -> runExceptT $ do
             liftIO $ deleteCommand db cmdId
-            pending <- liftIO $ hasNonQSecureCommand db connId srv
+            pending <- liftIO $ either (const True) isJust <$> getPendingServerCommand db connId (Just srv)
             pending <$ ExceptT (createCommand db corrId connId server_ command)
           when otherCmds . atomically $ hasWorkToDo' doWork
         notify :: forall e. AEntityI e => AEvent e -> AM ()
