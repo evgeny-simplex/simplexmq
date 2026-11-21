@@ -2374,9 +2374,9 @@ endAgentOperation c op = endOperation c op $ case op of
     suspendSendingAndDatabase c
   AOSndNetwork ->
     suspendOperation c AODatabase $
-      notifySuspended c
+      setSuspended c
   AODatabase ->
-    notifySuspended c
+    setSuspended c
 
 suspendMsgDelivery :: AgentClient -> STM ()
 suspendMsgDelivery c =
@@ -2387,7 +2387,7 @@ suspendSendingAndDatabase :: AgentClient -> STM ()
 suspendSendingAndDatabase c =
   suspendOperation c AOSndNetwork $
     suspendOperation c AODatabase $
-      notifySuspended c
+      setSuspended c
 
 suspendOperation :: AgentClient -> AgentOperation -> STM () -> STM ()
 suspendOperation c op endedAction = do
@@ -2395,11 +2395,15 @@ suspendOperation c op endedAction = do
   -- unsafeIOToSTM $ putStrLn $ "suspendOperation_ " <> show op <> " " <> show n
   when (n == 0) $ whenSuspending c endedAction
 
-notifySuspended :: AgentClient -> STM ()
-notifySuspended c = do
-  -- unsafeIOToSTM $ putStrLn "notifySuspended"
-  writeTBQueue (subQ c) ("", "", AEvt SAENone SUSPENDED)
-  writeTVar (agentState c) ASSuspended
+setSuspended :: AgentClient -> STM ()
+setSuspended c = writeTVar (agentState c) ASSuspended
+
+notifySuspended :: AgentClient -> IO ()
+notifySuspended AgentClient {agentState, subQ} = do
+  suspended <- atomically $ readTVar agentState >>= \case
+    ASSuspending -> retry
+    s -> pure $ s == ASSuspended
+  when suspended . atomically $ writeTBQueue subQ ("", "", AEvt SAENone SUSPENDED)
 
 endOperation :: AgentClient -> AgentOperation -> STM () -> STM ()
 endOperation c op endedAction = do
