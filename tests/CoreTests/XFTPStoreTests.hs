@@ -1,36 +1,47 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module CoreTests.XFTPStoreTests (xftpStoreTests, xftpMigrationTests) where
 
+import AgentTests.FunctionalAPITests (runRight, runRight_)
 import Control.Monad
+import Control.Monad.Trans.Except (runExceptT)
+import qualified Data.ByteString.Char8 as B
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Word (Word32)
 import qualified Database.PostgreSQL.Simple as DB
+import Simplex.FileTransfer.Client (XFTPChunkSpec (..), createXFTPChunk, downloadXFTPChunk, uploadXFTPChunk)
+import Simplex.FileTransfer.Description (kb)
 import Simplex.FileTransfer.Protocol (FileInfo (..), SFileParty (..))
+import Simplex.FileTransfer.Server.Env (AFStoreType (..))
 import Simplex.FileTransfer.Server.Store
 import Simplex.FileTransfer.Server.Store.Postgres (PostgresFileStore (..), importFileStore, exportFileStore)
+import Simplex.FileTransfer.Server.Store.Postgres.Config (PostgresFileStoreCfg (..))
 import Simplex.FileTransfer.Server.StoreLog (closeStoreLog, readWriteFileStore, serverFileName, writeFileStore)
-import Simplex.FileTransfer.Transport (XFTPErrorType (..))
+import Simplex.FileTransfer.Transport (XFTPErrorType (..), XFTPRcvChunkSpec (..))
 import Simplex.Messaging.Agent.Store.Postgres.Common (DBStore (..), DBStorePool (..), withTransaction)
+import Simplex.Messaging.Client (ProtocolClientError (..))
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Protocol (BlockingInfo (..), BlockingReason (..), EntityId (..))
 import Simplex.Messaging.Server.QueueStore (ServerEntityStatus (..))
 import Simplex.Messaging.Server.StoreLog (openWriteStoreLog)
 import Simplex.Messaging.SystemTime (RoundedSystemTime (..))
-import System.Directory (doesFileExist, removeFile)
+import System.Directory (doesFileExist, listDirectory, removeFile)
 import System.FilePath ((</>))
 import System.Timeout (timeout)
 import Test.Hspec hiding (fit, it)
 import UnliftIO.Async (async, wait)
 import UnliftIO.STM
 import Util
-import XFTPClient (testXFTPPostgresCfg)
+import XFTPClient (cfgFS, testXFTPClient, testXFTPPostgresCfg, withXFTPServerConfigOn, xftpServerFiles, xftpServerUploads)
 
 xftpStoreTests :: Spec
 xftpStoreTests = do
-  describe "STMFileStore operations" $
+  describe "STMFileStore operations" $ do
     it "should compute committed used storage and file count" testSTMStorageAndCount
+    it "should set file path with IS NULL guard" testSTMSetFilePath
   describe "PostgresFileStore operations" $ do
     it "should add and get file by sender" testAddGetFileSender
     it "should add and get file by recipient" testAddGetFileRecipient
@@ -44,7 +55,9 @@ xftpStoreTests = do
     it "should ack file reception" testAckFile
     it "should return expired files with limit" testExpiredFiles
     it "should expire files by stored expiration" testExpiredFilesStoredExpiration
+    it "should log each file deletion once" testDeleteFilesLog
     it "should compute committed used storage and file count" testStorageAndCount
+    it "should answer TIMEOUT to an upload whose commit fails and keep its chunk" testUploadCommitError
 
 xftpMigrationTests :: Spec
 xftpMigrationTests = describe "XFTP migration round-trip" $ do
@@ -139,19 +152,33 @@ testGetFileTimeout = withPgStore $ \st -> do
   atomically (lengthTBQueue $ dbPoolConns $ dbPool $ dbStore st) `shouldReturn` fromIntegral (dbPoolSize $ dbStore st)
 
 testSetFilePath :: HasTestEnv => Expectation
-testSetFilePath = withPgStore $ \st -> do
+testSetFilePath = withPgStore $ \st ->
+  testSetFilePathForStore st $ void $ withTransaction (dbStore st) (`DB.execute_` "UPDATE files SET status = 'off'")
+
+testSTMSetFilePath :: Expectation
+testSTMSetFilePath = do
+  st <- newFileStore () :: IO STMFileStore
+  testSetFilePathForStore st $ do
+    Right (FileRec {fileStatus}, _) <- getFile st SFSender testSenderId
+    atomically $ writeTVar fileStatus EntityOff
+  closeFileStore st
+
+testSetFilePathForStore :: FileStoreClass s => s -> IO () -> Expectation
+testSetFilePathForStore st setFileOff = do
   g <- C.newRandom
   (sndKey, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
   let fileInfo = testFileInfo sndKey
   addFile st testSenderId fileInfo testCreatedAt Nothing EntityActive `shouldReturn` Right ()
   setFilePath st testSenderId "/tmp/test_file" `shouldReturn` Right ()
   -- Second setFilePath should fail (file_path IS NULL guard)
-  setFilePath st testSenderId "/tmp/other_file" `shouldReturn` Left AUTH
+  setFilePath st testSenderId "/tmp/other_file" `shouldReturn` Left DUPLICATE_
   -- Verify path was set
   result <- getFile st SFSender testSenderId
   case result of
     Right (FileRec {filePath}, _) -> readTVarIO filePath `shouldReturn` Just "/tmp/test_file"
     Left e -> expectationFailure $ "getFile failed: " <> show e
+  setFileOff
+  setFilePath st testSenderId "/tmp/other_file" `shouldReturn` Left AUTH
 
 testDuplicateRecipient :: HasTestEnv => Expectation
 testDuplicateRecipient = withPgStore $ \st -> do
@@ -171,7 +198,7 @@ testDeleteFileCascade = withPgStore $ \st -> do
   let fileInfo = testFileInfo sndKey
   addFile st testSenderId fileInfo testCreatedAt Nothing EntityActive `shouldReturn` Right ()
   addRecipient st testSenderId (FileRecipient testRecipientId rcpKey) `shouldReturn` Right ()
-  deleteFile st testSenderId `shouldReturn` Right ()
+  deleteFile st testSenderId `shouldReturn` Right Nothing
   -- File and recipient should both be gone
   getFile st SFSender testSenderId >>= (`shouldBe` Left AUTH) . fmap (const ())
   getFile st SFRecipient testRecipientId >>= (`shouldBe` Left AUTH) . fmap (const ())
@@ -183,7 +210,7 @@ testBlockFile = withPgStore $ \st -> do
   let fileInfo = testFileInfo sndKey
   addFile st testSenderId fileInfo testCreatedAt Nothing EntityActive `shouldReturn` Right ()
   let blockInfo = BlockingInfo {reason = BRContent, notice = Nothing}
-  blockFile st testSenderId blockInfo False `shouldReturn` Right ()
+  blockFile st testSenderId blockInfo False `shouldReturn` Right Nothing
   result <- getFile st SFSender testSenderId
   case result of
     Right (FileRec {fileStatus}, _) -> readTVarIO fileStatus `shouldReturn` EntityBlocked blockInfo
@@ -238,6 +265,21 @@ testExpiredFilesStoredExpiration = withPgStore $ \st -> do
   expired <- expiredFiles st (RoundedSystemTime 500000) 0 100
   map (\(sId, _, _) -> sId) expired `shouldBe` [EntityId "expired_file____"]
 
+testDeleteFilesLog :: HasTestEnv => Expectation
+testDeleteFilesLog = do
+  let storeLogPath = testPath "xftp-delete-files.log"
+      otherId = EntityId "other_file______"
+  st <- newFileStore testXFTPPostgresCfg {dbStoreLogPath = Just storeLogPath} :: IO PostgresFileStore
+  g <- C.newRandom
+  (sndKey, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+  let fileInfo = testFileInfo sndKey
+  addFile st testSenderId fileInfo testCreatedAt Nothing EntityActive `shouldReturn` Right ()
+  addFile st otherId fileInfo testCreatedAt Nothing EntityActive `shouldReturn` Right ()
+  void $ deleteFile st testSenderId
+  void $ deleteFiles st [testSenderId, otherId]
+  closeFileStore st
+  map (take 4) . lines <$> readFile storeLogPath `shouldReturn` ["FNEW", "FNEW", "FDEL", "FDEL"]
+
 testStorageAndCount :: HasTestEnv => Expectation
 testStorageAndCount = withPgStore $ \st -> do
   testStorageAndCountForStore st
@@ -266,6 +308,32 @@ testStorageAndCountForStore st = do
   getUsedStorage st `shouldReturn` 128000
   setFilePath st fileB "/tmp/file_b" `shouldReturn` Right ()
   getUsedStorage st `shouldReturn` 192000
+  void $ blockFile st fileA BlockingInfo {reason = BRSpam, notice = Nothing} True
+  getUsedStorage st `shouldReturn` 64000
+
+testUploadCommitError :: HasTestEnv => Expectation
+testUploadCommitError = withXFTPServerConfigOn (cfgFS $ AFSType SFSPostgres) $ \_ -> testXFTPClient $ \c -> withPgStore $ \st -> do
+  g <- C.newRandom
+  (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+  (rcvKey, rpKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+  bytes <- atomically $ C.randomBytes (kb 64) g
+  B.writeFile chunkPath bytes
+  let digest = C.sha256Hash bytes
+      file = FileInfo {sndKey, size = kb 64, digest}
+      chunkSpec = XFTPChunkSpec {filePath = chunkPath, chunkOffset = 0, chunkSize = kb 64}
+      alterFiles q = void $ withTransaction (dbStore st) (`DB.execute_` q)
+  (sId, rId :| _, _) <- runRight $ createXFTPChunk c spKey file (rcvKey :| []) Nothing Nothing
+  alterFiles "ALTER TABLE files ADD CONSTRAINT test_no_file_path CHECK (file_path IS NULL)"
+  runExceptT (uploadXFTPChunk c spKey sId chunkSpec) `shouldReturn` Left (PCEProtocolError TIMEOUT)
+  doesFileExist (xftpServerFiles </> serverFileName sId) `shouldReturn` True
+  listDirectory xftpServerUploads `shouldReturn` []
+  alterFiles "ALTER TABLE files DROP CONSTRAINT test_no_file_path"
+  runRight_ $ uploadXFTPChunk c spKey sId chunkSpec
+  runRight_ $ downloadXFTPChunk g c rpKey rId $ XFTPRcvChunkSpec rcvPath (kb 64) digest
+  B.readFile rcvPath `shouldReturn` bytes
+  where
+    chunkPath = testPath "chunk1"
+    rcvPath = testPath "received_chunk1"
 
 -- Migration round-trip test
 

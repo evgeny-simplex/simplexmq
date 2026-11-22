@@ -29,7 +29,7 @@ import System.IO.Silently (capture, capture_, silence)
 import Test.Hspec hiding (fit, it)
 import Util
 import Simplex.FileTransfer.Server.Env (AFStoreType)
-import XFTPClient (cfgFS, cfgFS2, withXFTPServer, withXFTPServerConfigOn, testXFTPServerStr, testXFTPServerStr2, xftpServerFiles, xftpServerFiles2)
+import XFTPClient (cfgFS, cfgFS2, listServerFiles, withXFTPServer, withXFTPServerConfigOn, testXFTPServerStr, testXFTPServerStr2, xftpServerFiles, xftpServerFiles2)
 
 xftpCLIFileTests :: SpecWith AFStoreType
 xftpCLIFileTests = do
@@ -170,13 +170,13 @@ testXFTPCLIDelete_ = do
   progress1 `shouldSatisfy` downloadProgress "testfile"
   recvResult `shouldBe` ["File description " <> fdRcv1 <> " is deleted."]
   LB.readFile (recipientFiles </> "testfile") `shouldReturn` file
-  fs1 <- listDirectory xftpServerFiles
-  fs2 <- listDirectory xftpServerFiles2
+  fs1 <- listServerFiles xftpServerFiles
+  fs2 <- listServerFiles xftpServerFiles2
   length fs1 + length fs2 `shouldBe` 6
   xftpCLI ["del", fdSnd, "-y"]
     `shouldReturn` ["File deleted!            \r", "File description " <> fdSnd <> " is deleted."]
-  listDirectory xftpServerFiles >>= (`shouldBe` [])
-  listDirectory xftpServerFiles2 >>= (`shouldBe` [])
+  listServerFiles xftpServerFiles >>= (`shouldBe` [])
+  listServerFiles xftpServerFiles2 >>= (`shouldBe` [])
   xftpCLI ["recv", fdRcv2, recipientFiles, "--tmp=" <> testDir]
     `shouldThrow` anyException
 

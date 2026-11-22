@@ -24,6 +24,7 @@ import Data.Kind (Type)
 import Control.Concurrent.STM
 import Control.Monad
 import qualified Data.Attoparsec.ByteString.Char8 as A
+import Data.Either (rights)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as M
 import Data.Maybe (catMaybes, isJust)
@@ -78,10 +79,10 @@ class FileStoreClass s where
   addFile :: s -> SenderId -> FileInfo -> RoundedFileTime -> Maybe RoundedFileTime -> ServerEntityStatus -> IO (Either XFTPErrorType ())
   setFilePath :: s -> SenderId -> FilePath -> IO (Either XFTPErrorType ())
   addRecipient :: s -> SenderId -> FileRecipient -> IO (Either XFTPErrorType ())
-  deleteFile :: s -> SenderId -> IO (Either XFTPErrorType ())
-  deleteFiles :: s -> [SenderId] -> IO ()
-  deleteFiles s = mapM_ (void . deleteFile s)
-  blockFile :: s -> SenderId -> BlockingInfo -> Bool -> IO (Either XFTPErrorType ())
+  deleteFile :: s -> SenderId -> IO (Either XFTPErrorType (Maybe FilePath))
+  deleteFiles :: s -> [SenderId] -> IO [(SenderId, Maybe FilePath)]
+  deleteFiles s = fmap rights . mapM (\sId -> fmap (sId,) <$> deleteFile s sId)
+  blockFile :: s -> SenderId -> BlockingInfo -> Bool -> IO (Either XFTPErrorType (Maybe FilePath))
   deleteRecipient :: s -> RecipientId -> FileRec -> IO ()
   getFile :: s -> SFileParty p -> XFTPFileId -> IO (Either XFTPErrorType (FileRec, C.APublicAuthKey))
   ackFile :: s -> RecipientId -> IO (Either XFTPErrorType ())
@@ -116,14 +117,14 @@ instance FileStoreClass STMFileStore where
 
   setFilePath st sId fPath = atomically $
     withFile st sId $ \FileRec {filePath, fileStatus} -> do
-      readTVar filePath >>= \case
-        Just _ -> pure $ Left AUTH
-        Nothing ->
-          readTVar fileStatus >>= \case
-            EntityActive -> do
+      readTVar fileStatus >>= \case
+        EntityActive ->
+          readTVar filePath >>= \case
+            Just _ -> pure $ Left DUPLICATE_
+            Nothing -> do
               writeTVar filePath (Just fPath)
               pure $ Right ()
-            _ -> pure $ Left AUTH
+        _ -> pure $ Left AUTH
 
   addRecipient st@STMFileStore {recipients} senderId (FileRecipient rId rKey) = atomically $
     withFile st senderId $ \FileRec {recipientIds} -> do
@@ -138,15 +139,15 @@ instance FileStoreClass STMFileStore where
 
   deleteFile STMFileStore {files, recipients} senderId = atomically $ do
     TM.lookupDelete senderId files >>= \case
-      Just FileRec {recipientIds} -> do
+      Just FileRec {recipientIds, filePath} -> do
         readTVar recipientIds >>= mapM_ (`TM.delete` recipients)
-        pure $ Right ()
+        Right <$> readTVar filePath
       _ -> pure $ Left AUTH
 
   blockFile st senderId info _deleted = atomically $
-    withFile st senderId $ \FileRec {fileStatus} -> do
+    withFile st senderId $ \FileRec {fileStatus, filePath} -> do
       writeTVar fileStatus $! EntityBlocked info
-      pure $ Right ()
+      Right <$> swapTVar filePath Nothing
 
   deleteRecipient STMFileStore {recipients} rId FileRec {recipientIds} = atomically $ do
     TM.delete rId recipients
