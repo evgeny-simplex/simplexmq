@@ -2732,7 +2732,7 @@ testSendWhileAckWaitsForFullQueue = withAgentClients3 $ \alice bob carol -> do
       \case ("1", c, AEvt SAEConn OK) -> c == aliceId; _ -> False,
       \case ("", c, AEvt SAEConn (SENT _)) -> c == aliceId; _ -> False
     ]
-      <> zipWith (\i (cId, _) -> \case ("", c, AEvt SAEConn (Msg body)) -> c == cId && body == floodMsg i; _ -> False) [1 ..] floodConns
+      <> zipWith (\i (cId, _) -> \case ("", c, AEvt SAEConn (Msg body)) -> c == cId && body == floodMsg i; _ -> False) [1 :: Int ..] floodConns
   where
     sendAndSent :: AgentClient -> ConnId -> MsgBody -> ExceptT AgentErrorType IO ()
     sendAndSent c connId body = do
