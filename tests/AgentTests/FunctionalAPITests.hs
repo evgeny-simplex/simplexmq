@@ -493,6 +493,8 @@ functionalAPITests ps = do
       testDuplicateMessageAfterSent ps
     it "should acknowledge a message again after it is deleted" $
       withSmpServer ps testAckDeletedMessage
+    it "should send messages while an acknowledgement waits for space in the message queue" $
+      withSmpServer ps testSendWhileAckWaitsForFullQueue
     it "should report error via msg integrity on skipped messages" $
       testSkippedMessages ps
     it "should connect to the server when server goes up if it initially was down" $
@@ -2004,9 +2006,12 @@ getUpInfoCon c upConnIds connId info =
     ]
 
 waitAck :: AgentClient -> ConnId -> IO ()
-waitAck c connId = do
+waitAck c connId = waitQueueSize c connId 0
+
+waitQueueSize :: AgentClient -> ConnId -> Int -> IO ()
+waitQueueSize c connId size = do
   ServerQueueInfo {info = QueueInfo {qiSize}} <- runRight $ getConnectionQueueInfo c NRMInteractive connId
-  when (qiSize > 0) $ threadDelay 20000 >> waitAck c connId
+  when (qiSize /= size) $ threadDelay 20000 >> waitQueueSize c connId size
 
 testContactErrors :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> Bool -> IO ()
 testContactErrors ps restart = do
@@ -2704,6 +2709,40 @@ testAckDeletedMessage =
     ackMessage bob aliceId 2 Nothing
     ackMessageAsync bob "1" aliceId 2 Nothing
     liftIO $ noMessages bob "nothing else should be delivered to bob"
+
+testSendWhileAckWaitsForFullQueue :: HasTestEnv => IO ()
+testSendWhileAckWaitsForFullQueue = withAgentClients3 $ \alice bob carol -> do
+  (aliceId, bobId) <- runRight $ makeConnection alice bob
+  (carolId, bobCarolId) : floodConns <- runRight $ replicateM 10 $ makeConnection carol bob
+  a1Id <- runRight $ do
+    sendAndSent alice bobId "a1"
+    sendAndSent alice bobId "a2"
+    ("", c, Msg' a1Id _ "a1") <- get bob
+    liftIO $ c `shouldBe` aliceId
+    sendAndSent carol bobCarolId "c0"
+    get bob =##> \case ("", c', Msg "c0") -> c' == carolId; _ -> False
+    forM_ (zip [1 ..] floodConns) $ \(i, (_, bId)) -> sendAndSent carol bId $ floodMsg i
+    pure a1Id
+  timeout 10_000000 (atomically $ isFullTBQueue (msgQ bob) >>= checkSTM) `shouldReturn` Just ()
+  runRight_ $ ackMessageAsync bob "1" aliceId a1Id Nothing
+  timeout 10_000000 (waitQueueSize bob aliceId 1) `shouldReturn` Just ()
+  timeout 10_000000 (runExceptT $ sendMessages bob [(aliceId, PQEncOn, SMP.noMsgFlags, vrValue "b1")]) >>= (`shouldSatisfy` sent)
+  getInAnyOrder bob $
+    [ \case ("", c, AEvt SAEConn (Msg "a2")) -> c == aliceId; _ -> False,
+      \case ("1", c, AEvt SAEConn OK) -> c == aliceId; _ -> False,
+      \case ("", c, AEvt SAEConn (SENT _)) -> c == aliceId; _ -> False
+    ]
+      <> zipWith (\i (cId, _) -> \case ("", c, AEvt SAEConn (Msg body)) -> c == cId && body == floodMsg i; _ -> False) [1 ..] floodConns
+  where
+    sendAndSent :: AgentClient -> ConnId -> MsgBody -> ExceptT AgentErrorType IO ()
+    sendAndSent c connId body = do
+      msgId <- sendMessage c connId SMP.noMsgFlags body
+      get c ##> ("", connId, SENT msgId)
+    floodMsg :: Int -> MsgBody
+    floodMsg i = "c" <> bshow i
+    sent = \case
+      Just (Right [Right _]) -> True
+      _ -> False
 
 testSkippedMessages :: (HasCallStack, HasTestEnv) => (ASrvTransport, AStoreType) -> IO ()
 testSkippedMessages (t, msType) = do
