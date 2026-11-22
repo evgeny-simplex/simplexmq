@@ -87,7 +87,8 @@ xftpServerTests = do
       it "should complete concurrent uploads of a chunk and serve the whole chunk meanwhile" testConcurrentChunkUpload
       it "should complete a repeated upload of a stalled chunk and release the stalled upload's storage" testStalledChunkUpload
       it "should refuse an upload of a file deleted during the upload and release its storage" testDeleteDuringUpload
-      it "should delete expired files before removing their chunks" testUploadDuringExpiration
+      it "should remove a chunk uploaded while its file expires" testUploadDuringExpiration
+      it "should remove the chunks of expired files after a stop during their expiration" testStopDuringExpiration
       it "should store file records to log and restore them after server restart" testFileLog
       it "should remove unfinished uploads when the server starts" testRemoveUploadsOnStart
       describe "XFTP basic auth" $ do
@@ -469,9 +470,31 @@ testUploadDuringExpiration fsType = do
     testXFTPClient $ \c -> do
       runRight_ $ forM_ uploadedIds $ \fId -> uploadXFTPChunk c spKey fId chunkSpec
       timeout 10000000 waitExpiration `shouldReturn` Just ()
-      runExceptT (uploadXFTPChunk c spKey sId chunkSpec) `shouldReturn` Left (PCEProtocolError AUTH)
+      runRight_ $ uploadXFTPChunk c spKey sId chunkSpec
     timeout 10000000 waitRemoved `shouldReturn` Just ()
     listDirectory xftpServerUploads `shouldReturn` []
+  where
+    fileExpiration = ExpirationConfig {ttl = 3600, checkInterval = 1}
+
+testStopDuringExpiration :: HasTestEnv => AFStoreType -> Expectation
+testStopDuringExpiration fsType = do
+  g <- C.newRandom
+  (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+  void $ createTestChunk testChunkPath
+  digest <- LC.sha256Hash <$> LB.readFile testChunkPath
+  RoundedSystemTime now <- getSystemSeconds
+  let file = FileInfo {sndKey, size = chSize, digest}
+      chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = chSize}
+      fileIds = map (\i -> EntityId $ "expiring_file_" <> bshow (i :: Int)) [1 .. 20]
+      chunkFiles = map ((xftpServerFiles </>) . serverFileName) fileIds
+      waitExpiration = whenM (and <$> mapM doesFileExist chunkFiles) $ threadDelay 10000 >> waitExpiration
+  addTestFiles fsType fileIds file (RoundedSystemTime now) (Just $ RoundedSystemTime $ now + 5)
+  withXFTPServerConfigOn (updateXFTPCfg (cfgFSTestFiles fsType) $ \c -> c {fileExpiration}) $ \_ -> do
+    testXFTPClient $ \c -> runRight_ $ forM_ fileIds $ \fId -> uploadXFTPChunk c spKey fId chunkSpec
+    timeout 10000000 waitExpiration `shouldReturn` Just ()
+  null <$> listServerFiles xftpServerFiles `shouldReturn` False
+  withXFTPServerConfigOn (cfgFSTestFiles fsType) $ \_ ->
+    listServerFiles xftpServerFiles `shouldReturn` []
   where
     fileExpiration = ExpirationConfig {ttl = 3600, checkInterval = 1}
 
