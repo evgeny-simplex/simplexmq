@@ -34,7 +34,8 @@ import Simplex.Messaging.Transport (defaultSupportedParams)
 import Simplex.Messaging.Transport.HTTP2 (defaultHTTP2BufferSize, httpALPN)
 import Simplex.Messaging.Transport.HTTP2.Server (runHTTP2Server)
 import Simplex.Messaging.Transport.Server
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, listDirectory)
+import System.FilePath ((</>))
 import Test.Hspec hiding (fit, it)
 import UnliftIO.STM (TMVar, atomically, newEmptyTMVarIO, putTMVar)
 import Util
@@ -206,8 +207,14 @@ testXFTPServerStr2 = "xftp://LcJUMfVhwD8yxjAiSaDzzGF3-kLG4Uh0Fl_ZIjrRwjI=@localh
 xftpServerFiles :: HasTestEnv => FilePath
 xftpServerFiles = testPath "xftp-server-files"
 
+xftpServerUploads :: HasTestEnv => FilePath
+xftpServerUploads = xftpServerFiles </> "uploads"
+
 xftpServerFiles2 :: HasTestEnv => FilePath
 xftpServerFiles2 = testPath "xftp-server-files2"
+
+listServerFiles :: FilePath -> IO [FilePath]
+listServerFiles dir = filter (/= "uploads") <$> listDirectory dir
 
 testXFTPLogFile :: HasTestEnv => FilePath
 testXFTPLogFile = testPath "xftp-server-store.log"

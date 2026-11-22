@@ -17,6 +17,7 @@ import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import qualified Crypto.PubKey.RSA as RSA
 import Data.Bifunctor (first)
+import qualified Data.ByteString.Base64.URL as B64
 import Data.ByteString.Builder (byteString)
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
@@ -35,7 +36,7 @@ import SMPClient (copyWebCredential, testCredentialCheckInterval, testWebCredent
 import ServerTests (logSize)
 import Simplex.FileTransfer.Client hiding (createXFTPChunk)
 import qualified Simplex.FileTransfer.Client as A
-import Simplex.FileTransfer.Description (kb)
+import Simplex.FileTransfer.Description (kb, mb)
 import Simplex.FileTransfer.Protocol (FileCmd (..), FileCommand (..), FileInfo (..), FileResponse (..), SFileParty (..), XFTPFileId, xftpBlockSize, xftpDecodeTClient, xftpEncodeAuthTransmission)
 import Simplex.FileTransfer.Server.Env (AFStoreType, XFTPServerConfig (..))
 import Simplex.FileTransfer.Server.StoreLog (serverFileName)
@@ -51,12 +52,14 @@ import Simplex.Messaging.Transport (CertChainPubKey (..), TLS (..), TransportPee
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTLSTransportClient)
 import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..))
 import qualified Simplex.Messaging.Transport.HTTP2.Client as HC
+import Simplex.Messaging.Transport.HTTP2.File (fileBlockSize, hSendFile)
 import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential)
 import Simplex.Messaging.Transport.Shared (ChainCertificates (..), chainIdCaCerts)
 import Simplex.Messaging.Util (bshow, unlessM, whenM)
 import Simplex.Messaging.Version (mkVersionRange)
 import System.Directory (doesFileExist, listDirectory, removeFile)
 import System.FilePath ((</>))
+import System.IO (IOMode (..), SeekMode (..), hSeek, withFile)
 import Test.Hspec hiding (fit, it)
 import UnliftIO.Async (async, cancel, pooledReplicateConcurrentlyN, race_, wait)
 import UnliftIO.STM
@@ -81,11 +84,12 @@ xftpServerTests = do
       it "should time out receiving file chunk" $ \_ -> testReceiveFileTimeout
       it "should not allow uploading chunks after specified storage quota" testFileStorageQuota
       it "should release storage of interrupted uploads" testInterruptedUploadStorage
-      it "should complete a new upload of a chunk without waiting for the paused upload it replaces" testConcurrentChunkUpload
-      it "should cancel a stalled upload and release its storage when its chunk is uploaded again" testCancelStalledChunkUpload
-      it "should remove a chunk uploaded while its file expires" testUploadDuringExpiration
+      it "should complete concurrent uploads of a chunk and serve the whole chunk meanwhile" testConcurrentChunkUpload
+      it "should complete a repeated upload of a stalled chunk and release the stalled upload's storage" testStalledChunkUpload
+      it "should refuse an upload of a file deleted during the upload and release its storage" testDeleteDuringUpload
+      it "should delete expired files before removing their chunks" testUploadDuringExpiration
       it "should store file records to log and restore them after server restart" testFileLog
-      it "should remove files without stored chunks when the server starts" testRemoveUnstoredFiles
+      it "should remove unfinished uploads when the server starts" testRemoveUploadsOnStart
       describe "XFTP basic auth" $ do
         --                                               allow FNEW | server auth | clnt auth | success
         it "prohibited without basic auth" $ testFileBasicAuth True (Just "pwd") Nothing False
@@ -115,10 +119,16 @@ chSize = kb 128
 testChunkPath :: HasTestEnv => FilePath
 testChunkPath = testPath "chunk1"
 
+largeChunkSize :: Integral a => a
+largeChunkSize = mb 4
+
 createTestChunk :: FilePath -> IO ByteString
-createTestChunk fp = do
+createTestChunk = createTestChunkOfSize chSize
+
+createTestChunkOfSize :: Int -> FilePath -> IO ByteString
+createTestChunkOfSize sz fp = do
   g <- C.newRandom
-  bytes <- atomically $ C.randomBytes chSize g
+  bytes <- atomically $ C.randomBytes sz g
   B.writeFile fp bytes
   pure bytes
 
@@ -126,7 +136,7 @@ createXFTPChunk :: XFTPClient -> C.APrivateAuthKey -> FileInfo -> NonEmpty C.APu
 createXFTPChunk c spKey file rcps auth = (\(sId, rIds, _) -> (sId, rIds)) <$> A.createXFTPChunk c spKey file rcps auth Nothing
 
 readChunk :: HasTestEnv => XFTPFileId -> IO ByteString
-readChunk sId = B.readFile (xftpServerFiles </> serverFileName sId)
+readChunk sId = B.readFile (xftpServerFiles </> B.unpack (B64.encode $ unEntityId sId))
 
 testFileChunkDelivery :: HasTestEnv => AFStoreType -> Expectation
 testFileChunkDelivery = xftpTest $ \c -> runRight_ $ runTestFileChunkDelivery c c
@@ -343,69 +353,101 @@ testInterruptedUploadStorage fsType = withXFTPServerConfigOn (updateXFTPCfg (cfg
           sId <$ closeXFTPClient c
     sIds <- pooledReplicateConcurrentlyN 10 300 interruptUpload
     threadDelay 1000000
-    listDirectory xftpServerFiles `shouldReturn` []
+    listServerFiles xftpServerFiles `shouldReturn` []
+    listDirectory xftpServerUploads `shouldReturn` []
     testXFTPClient $ \c -> runRight_ $ forM_ (take 10 sIds) $ \sId -> uploadXFTPChunk c spKey sId chunkSpec
 
+startChunkUpload :: XFTPClient -> C.APrivateAuthKey -> SenderId -> XFTPChunkSpec -> IO (IO (Either XFTPErrorType ()))
+startChunkUpload XFTPClient {http2Client, thParams} spKey sId XFTPChunkSpec {filePath, chunkSize} = do
+  t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams spKey ("", sId, FileCmd SFSender FPUT)
+  sent <- newEmptyTMVarIO
+  resume <- newEmptyTMVarIO
+  let half = chunkSize `div` 2
+      req = H2.requestStreaming "POST" "/" [] $ \send flush -> withFile filePath ReadMode $ \h -> do
+        send $ byteString t
+        hSendFile h send half
+        flush
+        atomically $ putTMVar sent ()
+        atomically $ takeTMVar resume
+        hSeek h AbsoluteSeek $ fromIntegral half
+        hSendFile h send $ chunkSize - half
+        flush
+  upload <- async $ HC.sendRequest http2Client req Nothing
+  timeout 5000000 (atomically $ takeTMVar sent) `shouldReturn` Just ()
+  pure $ do
+    atomically $ putTMVar resume ()
+    HC.HTTP2Response {HC.respBody = HTTP2Body {bodyHead}} <- either (error . show) pure =<< wait upload
+    case xftpDecodeTClient thParams bodyHead of
+      Right (_, _, Right FROk) -> pure $ Right ()
+      Right (_, _, Right (FRErr e)) -> pure $ Left e
+      r -> error $ "unexpected response: " <> show r
+
 testConcurrentChunkUpload :: HasTestEnv => AFStoreType -> Expectation
-testConcurrentChunkUpload = xftpTest2 $ \c@XFTPClient {http2Client, thParams} c' -> do
+testConcurrentChunkUpload = xftpTest2 $ \c c'@XFTPClient {http2Client, thParams} -> do
   g <- C.newRandom
   (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
   (rcvKey, rpKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
-  bytes <- createTestChunk testChunkPath
+  bytes <- createTestChunkOfSize largeChunkSize testChunkPath
   digest <- LC.sha256Hash <$> LB.readFile testChunkPath
-  let file = FileInfo {sndKey, size = chSize, digest}
-      chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = chSize}
+  let file = FileInfo {sndKey, size = largeChunkSize, digest}
+      chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = largeChunkSize}
   (sId, [rId]) <- runRight $ createXFTPChunk c spKey file [rcvKey] Nothing
-  t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams spKey ("", sId, FileCmd SFSender FPUT)
-  resume <- newEmptyTMVarIO
-  let (part1, part2) = B.splitAt (chSize `div` 2) bytes
-      req = H2.requestStreaming "POST" "/" [] $ \send flush -> do
-        send $ byteString t
-        send $ byteString part1
-        flush
-        atomically $ takeTMVar resume
-        send $ byteString part2
-        flush
-      serverFile = xftpServerFiles </> serverFileName sId
-      waitServerFile = unlessM (doesFileExist serverFile) $ threadDelay 10000 >> waitServerFile
-  upload1 <- async $ HC.sendRequest http2Client req Nothing
-  timeout 5000000 waitServerFile `shouldReturn` Just ()
-  timeout 5000000 (runExceptT $ uploadXFTPChunk c' spKey sId chunkSpec) `shouldReturn` Just (Right ())
-  atomically $ putTMVar resume ()
-  HC.HTTP2Response {HC.respBody = HTTP2Body {bodyHead}} <- either (error . show) pure =<< wait upload1
-  case xftpDecodeTClient thParams bodyHead of
-    Right (_, _, Right (FRErr TIMEOUT)) -> pure ()
-    r -> expectationFailure $ "unexpected response: " <> show r
-  listDirectory xftpServerFiles `shouldReturn` [serverFileName sId]
-  runRight_ $ downloadXFTPChunk g c' rpKey rId $ XFTPRcvChunkSpec (testPath "received_chunk1") chSize digest
-  B.readFile (testPath "received_chunk1") `shouldReturn` bytes
+  completeUpload <- startChunkUpload c spKey sId chunkSpec
+  runExceptT (uploadXFTPChunk c' spKey sId chunkSpec) `shouldReturn` Right ()
+  (rDhKey, rpDhKey) <- atomically $ C.generateKeyPair g
+  t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams rpKey ("", rId, FileCmd SFRecipient (FGET rDhKey))
+  HC.HTTP2Response {HC.respBody = HTTP2Body {bodyHead, bodyPart = Just getBody}} <-
+    either (error . show) pure =<< HC.sendRequest http2Client (H2.requestBuilder "POST" "/" [] $ byteString t) Nothing
+  Right (_, _, Right (FRFile sDhKey cbNonce)) <- pure $ xftpDecodeTClient thParams bodyHead
+  sbState <- either (error . show) pure $ LC.cbInit (C.dh' sDhKey rpDhKey) cbNonce
+  received <- getBody fileBlockSize
+  completeUpload `shouldReturn` Right ()
+  rest <- getBody $ largeChunkSize + C.authTagSize
+  fst (LC.sbDecryptChunk sbState $ B.take largeChunkSize $ received <> rest) `shouldBe` bytes
+  listServerFiles xftpServerFiles `shouldReturn` [serverFileName sId]
+  listDirectory xftpServerUploads `shouldReturn` []
 
-testCancelStalledChunkUpload :: HasTestEnv => AFStoreType -> Expectation
-testCancelStalledChunkUpload fsType = withXFTPServerConfigOn (updateXFTPCfg (cfgFS fsType) $ \c -> c {fileSizeQuota = Just chSize}) $
-  \_ -> testXFTPClient $ \c@XFTPClient {http2Client, thParams} -> testXFTPClient $ \c' -> do
+testStalledChunkUpload :: HasTestEnv => AFStoreType -> Expectation
+testStalledChunkUpload fsType = withXFTPServerConfigOn (updateXFTPCfg (cfgFS fsType) $ \c -> c {fileSizeQuota = Just $ largeChunkSize * 2}) $
+  \_ -> testXFTPClient $ \c' -> do
     g <- C.newRandom
     (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
     (rcvKey, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
-    void $ createTestChunk testChunkPath
+    void $ createTestChunkOfSize largeChunkSize testChunkPath
     digest <- LC.sha256Hash <$> LB.readFile testChunkPath
-    let file = FileInfo {sndKey, size = chSize, digest}
-        chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = chSize}
-    (sId, _) <- runRight $ createXFTPChunk c spKey file [rcvKey] Nothing
-    t <- either (error . show) pure $ xftpEncodeAuthTransmission thParams spKey ("", sId, FileCmd SFSender FPUT)
-    let req = H2.requestStreaming "POST" "/" [] $ \send flush -> do
-          send $ byteString t
-          send $ byteString $ B.replicate 1024 'x'
-          flush
-          threadDelay maxBound
-        serverFile = xftpServerFiles </> serverFileName sId
-        waitServerFile = unlessM (doesFileExist serverFile) $ threadDelay 10000 >> waitServerFile
-    upload1 <- async $ HC.sendRequest http2Client req Nothing
-    timeout 5000000 waitServerFile `shouldReturn` Just ()
-    timeout 5000000 (runExceptT $ uploadXFTPChunk c' spKey sId chunkSpec) `shouldReturn` Just (Right ())
-    HC.HTTP2Response {HC.respBody = HTTP2Body {bodyHead}} <- either (error . show) pure =<< wait upload1
-    case xftpDecodeTClient thParams bodyHead of
-      Right (_, _, Right (FRErr TIMEOUT)) -> pure ()
-      r -> expectationFailure $ "unexpected response: " <> show r
+    let file = FileInfo {sndKey, size = largeChunkSize, digest}
+        chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = largeChunkSize}
+        createChunk = fst <$> runRight (createXFTPChunk c' spKey file [rcvKey] Nothing)
+        waitUploadsRemoved = unlessM (null <$> listDirectory xftpServerUploads) $ threadDelay 10000 >> waitUploadsRemoved
+    sId <- createChunk
+    testXFTPClient $ \c -> do
+      void $ startChunkUpload c spKey sId chunkSpec
+      runExceptT (uploadXFTPChunk c' spKey sId chunkSpec) `shouldReturn` Right ()
+      closeXFTPClient c
+    timeout 5000000 waitUploadsRemoved `shouldReturn` Just ()
+    sId2 <- createChunk
+    runExceptT (uploadXFTPChunk c' spKey sId2 chunkSpec) `shouldReturn` Right ()
+    sId3 <- createChunk
+    runExceptT (uploadXFTPChunk c' spKey sId3 chunkSpec) `shouldReturn` Left (PCEProtocolError QUOTA)
+
+testDeleteDuringUpload :: HasTestEnv => AFStoreType -> Expectation
+testDeleteDuringUpload fsType = withXFTPServerConfigOn (updateXFTPCfg (cfgFS fsType) $ \c -> c {fileSizeQuota = Just largeChunkSize}) $
+  \_ -> testXFTPClient $ \c -> testXFTPClient $ \c' -> do
+    g <- C.newRandom
+    (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+    (rcvKey, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+    void $ createTestChunkOfSize largeChunkSize testChunkPath
+    digest <- LC.sha256Hash <$> LB.readFile testChunkPath
+    let file = FileInfo {sndKey, size = largeChunkSize, digest}
+        chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = largeChunkSize}
+    (sId, _) <- runRight $ createXFTPChunk c' spKey file [rcvKey] Nothing
+    completeUpload <- startChunkUpload c spKey sId chunkSpec
+    runRight_ $ deleteXFTPChunk c' spKey sId
+    completeUpload `shouldReturn` Left AUTH
+    listServerFiles xftpServerFiles `shouldReturn` []
+    listDirectory xftpServerUploads `shouldReturn` []
+    (sId', _) <- runRight $ createXFTPChunk c' spKey file [rcvKey] Nothing
+    runRight_ $ uploadXFTPChunk c' spKey sId' chunkSpec
 
 testUploadDuringExpiration :: HasTestEnv => AFStoreType -> Expectation
 testUploadDuringExpiration fsType = do
@@ -421,19 +463,20 @@ testUploadDuringExpiration fsType = do
       uploadedIds = map fileId [1 .. 20]
       uploadedFiles = map ((xftpServerFiles </>) . serverFileName) uploadedIds
       waitExpiration = whenM (and <$> mapM doesFileExist uploadedFiles) $ threadDelay 10000 >> waitExpiration
-      waitRemoved = unlessM (null <$> listDirectory xftpServerFiles) $ threadDelay 10000 >> waitRemoved
+      waitRemoved = unlessM (null <$> listServerFiles xftpServerFiles) $ threadDelay 10000 >> waitRemoved
   addTestFiles fsType (sId : uploadedIds) file (RoundedSystemTime now) (Just $ RoundedSystemTime $ now + 5)
   withXFTPServerConfigOn (updateXFTPCfg (cfgFSTestFiles fsType) $ \c -> c {fileExpiration}) $ \_ -> do
     testXFTPClient $ \c -> do
       runRight_ $ forM_ uploadedIds $ \fId -> uploadXFTPChunk c spKey fId chunkSpec
       timeout 10000000 waitExpiration `shouldReturn` Just ()
-      runRight_ $ uploadXFTPChunk c spKey sId chunkSpec
+      runExceptT (uploadXFTPChunk c spKey sId chunkSpec) `shouldReturn` Left (PCEProtocolError AUTH)
     timeout 10000000 waitRemoved `shouldReturn` Just ()
+    listDirectory xftpServerUploads `shouldReturn` []
   where
     fileExpiration = ExpirationConfig {ttl = 3600, checkInterval = 1}
 
-testRemoveUnstoredFiles :: HasTestEnv => AFStoreType -> Expectation
-testRemoveUnstoredFiles fsType = do
+testRemoveUploadsOnStart :: HasTestEnv => AFStoreType -> Expectation
+testRemoveUploadsOnStart fsType = do
   g <- C.newRandom
   (sndKey, spKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
   (rcvKey, rpKey) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
@@ -441,14 +484,14 @@ testRemoveUnstoredFiles fsType = do
   digest <- LC.sha256Hash <$> LB.readFile testChunkPath
   let file = FileInfo {sndKey, size = chSize, digest}
       chunkSpec = XFTPChunkSpec {filePath = testChunkPath, chunkOffset = 0, chunkSize = chSize}
-  (sId, rId, partialId) <- withXFTPServerConfigOn (cfgFSTestFiles fsType) $ \_ -> testXFTPClient $ \c -> runRight $ do
+  (sId, rId) <- withXFTPServerConfigOn (cfgFSTestFiles fsType) $ \_ -> testXFTPClient $ \c -> runRight $ do
     (sId, [rId]) <- createXFTPChunk c spKey file [rcvKey] Nothing
     uploadXFTPChunk c spKey sId chunkSpec
-    (partialId, _) <- createXFTPChunk c spKey file [rcvKey] Nothing
-    pure (sId, rId, partialId)
-  forM_ ([partialId, EntityId "orphan_file_0000"] :: [SenderId]) $ \fId -> B.writeFile (xftpServerFiles </> serverFileName fId) "partial"
+    pure (sId, rId)
+  B.writeFile (xftpServerUploads </> "unfinished") "partial"
   withXFTPServerConfigOn (cfgFSTestFiles fsType) $ \_ -> do
-    listDirectory xftpServerFiles `shouldReturn` [serverFileName sId]
+    listDirectory xftpServerUploads `shouldReturn` []
+    listServerFiles xftpServerFiles `shouldReturn` [serverFileName sId]
     testXFTPClient $ \c -> runRight_ $ downloadXFTPChunk g c rpKey rId $ XFTPRcvChunkSpec (testPath "received_chunk1") chSize digest
   B.readFile (testPath "received_chunk1") `shouldReturn` bytes
 
