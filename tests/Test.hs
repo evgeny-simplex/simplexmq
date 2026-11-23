@@ -4,8 +4,11 @@
 import AgentTests (agentCoreTests, agentTests)
 import AgentTests.FunctionalAPITests (functionalAPITimingTests)
 import CLITests
+import Control.Concurrent (forkIO)
 import Control.Exception (bracket_)
 import Control.Logger.Simple
+import Control.Monad (forM_)
+import Data.Maybe (isJust)
 import CoreTests.BatchingTests
 import CoreTests.CryptoFileTests
 import CoreTests.CryptoTests
@@ -30,9 +33,10 @@ import Simplex.Messaging.Server.MsgStore.Types (SMSType (..), SQSType (..))
 import Simplex.Messaging.Transport (TLS, Transport (..))
 -- import Simplex.Messaging.Transport.WebSockets (WS)
 import System.Directory (createDirectoryIfMissing, listDirectory, removePathForcibly)
-import System.Environment (getArgs, setEnv, withArgs)
+import System.Environment (getArgs, lookupEnv, setEnv, withArgs)
 import System.FilePath ((</>))
 import Test.Hspec hiding (fit, it)
+import qualified Test.Hspec as Hspec
 import Test.Hspec.Core.Runner (defaultConfig, evalSpec, evaluateResult, readConfig, runSpecForest)
 import Util
 import XFTPAgent
@@ -72,7 +76,13 @@ logCfg = LogConfig {lc_file = Nothing, lc_stderr = True}
 main :: IO ()
 main = do
   setLogLevel testLogLevel
+  stress <- isJust <$> lookupEnv "IO_MANAGER_STRESS"
+  if stress then Hspec.hspec $ Hspec.it "IO manager close stress" ioManagerCloseStress else mainTests
+
+mainTests :: IO ()
+mainTests =
   withGlobalLogging logCfg $ do
+    _ <- forkIO ioManagerMonitor
     setEnv "APNS_KEY_ID" "H82WD9K9AQ"
     setEnv "APNS_KEY_FILE" "./tests/fixtures/AuthKey_H82WD9K9AQ.p8"
     setEnv "SYSTEM_CERTIFICATE_PATH" "./tests/fixtures/ca.crt"
@@ -131,6 +141,9 @@ main = do
           describe "XFTP" $ do
             describe "XFTP server" $
               before (pure $ AFSType SFSMemory) xftpServerTests
+            forM_ ([2 .. 6] :: [Int]) $ \i ->
+              describe ("XFTP server copy " <> show i) $
+                before (pure $ AFSType SFSMemory) xftpServerTests
             describe "XFTP file description" fileDescriptionTests
             describe "XFTP agent" $
               before (pure $ AFSType SFSMemory) xftpAgentTests

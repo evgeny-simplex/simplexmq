@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -10,8 +11,8 @@
 module XFTPServerTests (xftpServerTests) where
 
 import AgentTests.FunctionalAPITests (runRight, runRight_)
-import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, bracket)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
+import Control.Exception (SomeException, bracket, finally)
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.IO.Unlift
@@ -24,15 +25,21 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import qualified Data.CaseInsensitive as CI
 import Data.Either (isLeft)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find, isInfixOf)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Time.Clock (getCurrentTime)
+import qualified Data.Map.Strict as M
+import Data.Time.Clock (UTCTime, getCurrentTime)
+import GHC.Conc (threadStatus)
+import Network.Socket (unsafeFdSocket)
+import Network.Socket.ByteString (recv)
+import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.X509 as X
 import Data.X509.Validation (Fingerprint (..), getFingerprint)
 import Network.HPACK.Token (tokenKey)
 import qualified Network.HTTP2.Client as H2
 import qualified Network.TLS as T
-import SMPClient (copyWebCredential, testCredentialCheckInterval, testWebCredentialReload, testWebCredentialReplaced, testWebCredentials, withStallingServerOn, withStallingServerOn')
+import SMPClient (copyWebCredential, serverBracket, testCredentialCheckInterval, testWebCredentialReload, testWebCredentialReplaced, testWebCredentials, withStallingServerOn)
 import ServerTests (logSize)
 import Simplex.FileTransfer.Client hiding (createXFTPChunk)
 import qualified Simplex.FileTransfer.Client as A
@@ -47,16 +54,17 @@ import Simplex.Messaging.Encoding (smpDecode, smpEncode)
 import Simplex.Messaging.Protocol (BasicAuth, EntityId (..), RecipientId, SenderId, pattern NoEntity)
 import Simplex.Messaging.Server.Expiration (ExpirationConfig (..))
 import Simplex.Messaging.Transport (CertChainPubKey (..), TLS (..), TransportPeer (..), closeTLS, defaultSupportedParams, defaultSupportedParamsHTTPS)
-import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTLSTransportClient)
+import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), connectTraceVar, defaultTransportClientConfig, runTLSTransportClient)
 import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..))
 import qualified Simplex.Messaging.Transport.HTTP2.Client as HC
-import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential)
+import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential, runLocalTCPServer)
 import Simplex.Messaging.Transport.Shared (ChainCertificates (..), chainIdCaCerts)
+import Simplex.Messaging.Util (unlessM)
 import Simplex.Messaging.Version (mkVersionRange)
 import System.Directory (listDirectory, removeFile)
 import System.FilePath ((</>))
 import Test.Hspec hiding (fit, it)
-import UnliftIO.Async (async, cancel, pooledReplicateConcurrentlyN, race_)
+import UnliftIO.Async (Async, async, asyncThreadId, cancel, poll, pooledReplicateConcurrentlyN, race_)
 import UnliftIO.STM
 import UnliftIO.Timeout (timeout)
 import Util
@@ -250,14 +258,72 @@ testInactiveClientExpiration fsType = withXFTPServerConfigOn (updateXFTPCfg (cfg
   where
     inactiveClientExpiration = Just ExpirationConfig {ttl = 1, checkInterval = 1}
 
+connectTraces :: TVar (M.Map Int (IORef [(UTCTime, ThreadId, String)]))
+connectTraces = unsafePerformIO $ newTVarIO M.empty
+{-# NOINLINE connectTraces #-}
+
 testCancelledClientConnect :: HasTestEnv => Expectation
-testCancelledClientConnect =
-  withStallingServerOn' xftpTestPort $ \accepted closed -> replicateM_ 1000 $ do
-    ts <- getCurrentTime
-    a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
-    timeout 5000000 (atomically $ takeTMVar accepted) `shouldReturn` Just ()
-    timeout 5000000 (cancel a) `shouldReturn` Just ()
-    timeout 5000000 (atomically $ takeTMVar closed) `shouldReturn` Just ()
+testCancelledClientConnect = do
+  accepted <- newEmptyTMVarIO
+  closed <- newEmptyTMVarIO
+  trace <- newIORef []
+  let n = read xftpTestPort :: Int
+      log_ s = do
+        t <- getCurrentTime
+        tid <- myThreadId
+        atomicModifyIORef' trace $ \l -> ((t, tid, s) : l, ())
+      dispatch s = do
+        t <- getCurrentTime
+        tid <- myThreadId
+        readTVarIO connectTraces >>= mapM_ (\r -> atomicModifyIORef' r $ \l -> ((t, tid, s) : l, ()))
+      waitClosed sock = unlessM (B.null <$> recv sock 4096) $ waitClosed sock
+  writeIORef connectTraceVar $ Just dispatch
+  atomically $ modifyTVar' connectTraces $ M.insert n trace
+  flip finally (atomically $ modifyTVar' connectTraces $ M.delete n) $
+    serverBracket
+      ( \started -> runLocalTCPServer started xftpTestPort $ \sock -> do
+          fd <- unsafeFdSocket sock
+          log_ $ "server accepted fd " <> show fd <> " (bucket " <> show (fd `mod` 32) <> ")"
+          void $ atomically $ tryPutTMVar accepted ()
+          waitClosed sock
+          log_ $ "server received EOF on fd " <> show fd
+          void $ atomically $ tryPutTMVar closed ()
+      )
+      (pure ())
+      $ \srvTid -> forM_ ([1 .. 1000] :: [Int]) $ \i -> do
+        writeIORef trace []
+        ts <- getCurrentTime
+        a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
+        let step :: String -> IO b -> IO (Maybe ())
+            step name act =
+              timeout 5000000 act >>= \case
+                Just _ -> pure $ Just ()
+                Nothing -> do
+                  report n i name a srvTid trace
+                  r' <- timeout 30000000 act
+                  t <- getCurrentTime
+                  putStrLn $ "testCancelledClientConnect " <> show n <> ": iteration " <> show i <> ", " <> name <> " after a further wait of up to 30 s: " <> maybe "still waiting" (const "completed") r' <> " at " <> show t
+                  report n i (name <> ", after a further wait") a srvTid trace
+                  pure Nothing
+        step "accepted" (atomically $ takeTMVar accepted) `shouldReturn` Just ()
+        step "cancel" (cancel a) `shouldReturn` Just ()
+        step "closed" (atomically $ takeTMVar closed) `shouldReturn` Just ()
+  where
+    report :: Int -> Int -> String -> Async (Either XFTPClientError XFTPClient) -> ThreadId -> IORef [(UTCTime, ThreadId, String)] -> IO ()
+    report n i name a srvTid trace = do
+      t <- getCurrentTime
+      st <- threadStatus $ asyncThreadId a
+      sst <- threadStatus srvTid
+      p <- poll a
+      tr <- reverse <$> readIORef trace
+      probe <- probeIOManagers
+      let pollStr = case p of
+            Nothing -> "running"
+            Just (Left e) -> "exception " <> show e
+            Just (Right (Left e)) -> "error " <> show e
+            Just (Right (Right _)) -> "connected"
+      putStrLn $ "testCancelledClientConnect " <> show n <> ": iteration " <> show i <> ", " <> name <> " timed out at " <> show t <> ", client thread " <> show (asyncThreadId a) <> " " <> show st <> ", client " <> pollStr <> ", server thread " <> show sst <> ", IO manager probe (capability, buckets) " <> show probe
+      forM_ tr $ \(t', tid, s) -> putStrLn $ "  " <> show t' <> " " <> show tid <> " " <> s
 
 testTLSHandshakeTimeout :: HasTestEnv => Expectation
 testTLSHandshakeTimeout =

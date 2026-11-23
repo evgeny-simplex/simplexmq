@@ -25,6 +25,7 @@ module Simplex.Messaging.Transport.Client
     TransportHosts (..),
     TransportHosts_ (..),
     validateCertificateChain,
+    connectTraceVar,
   )
 where
 
@@ -62,6 +63,7 @@ import Simplex.Messaging.Transport.KeepAlive
 import Simplex.Messaging.Transport.Shared
 import Simplex.Messaging.Util (bshow, catchAll_, catchOwn, tshow, (<$?>))
 import System.IO.Error
+import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 import UnliftIO.Exception (IOException)
 import qualified UnliftIO.Exception as E
@@ -177,13 +179,15 @@ runTLSTransportClient tlsParams caStore_ cfg@TransportClientConfig {socksProxy, 
   E.bracket (set CHSocket $ connectTCP port) (\_ -> closeConn h) $ \sock -> do
     mapM_ (setSocketKeepAlive sock) tcpKeepAlive `catchOwn` \e -> logError ("Error setting TCP keep-alive " <> tshow e)
     let tCfg = clientTransportConfig cfg
+    connectTrace "TLS handshake starting"
     -- No TLS timeout to avoid failing connections via SOCKS
     tls <- set CHContext $ connectTLS (Just hostName) tCfg clientParams sock
+    connectTrace "TLS handshake done"
     chain <- takePeerCertChain serverCert
     sent <- readIORef clientCredsSent
     client =<< set CHTransport (getTransportConnection tCfg sent chain tls)
   where
-    closeConn = readIORef >=> mapM_ (\c -> E.uninterruptibleMask_ $ closeConn_ c `catchAll_` pure ())
+    closeConn = readIORef >=> mapM_ (\c -> E.uninterruptibleMask_ $ (connectTrace "closing" >> closeConn_ c >> connectTrace "closed") `catchAll_` pure ())
     closeConn_ = \case
       CHSocket sock -> close sock
       CHContext tls -> closeTLS tls
@@ -215,7 +219,20 @@ connectTCPClient host port = withSocketsDo $ resolve >>= tryOpen err
       E.bracketOnError
         (socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr))
         close
-        (\sock -> connect sock (addrAddress addr) $> sock)
+        (\sock -> do
+            fd <- unsafeFdSocket sock
+            connectTrace $ "socket fd " <> show fd <> " (bucket " <> show (fd `mod` 32) <> ") connecting to " <> show (addrAddress addr)
+            connect sock (addrAddress addr)
+              `E.catch` (\(e :: E.SomeException) -> connectTrace ("connect fd " <> show fd <> " failed: " <> show e) >> E.throwIO e)
+            connectTrace $ "connect fd " <> show fd <> " done"
+            pure sock)
+
+connectTraceVar :: IORef (Maybe (String -> IO ()))
+connectTraceVar = unsafePerformIO $ newIORef Nothing
+{-# NOINLINE connectTraceVar #-}
+
+connectTrace :: String -> IO ()
+connectTrace s = readIORef connectTraceVar >>= mapM_ ($ s)
 
 defaultSMPPort :: PortNumber
 defaultSMPPort = 5223

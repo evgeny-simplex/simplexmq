@@ -8,19 +8,24 @@
 
 module Util where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (forkIO, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception as E
 import Control.Logger.Simple
-import Control.Monad (replicateM, when)
+import Control.Monad (forM, forM_, forever, replicateM, replicateM_, when)
+import Data.Bits ((.&.))
 import Data.Either (partitionEithers)
-import Data.List (tails)
+import qualified Data.IntMap.Strict as IM
+import Data.List (foldl', tails)
+import qualified Data.Map.Strict as M
 import Data.String (IsString (..))
-import GHC.Conc (getNumCapabilities, getNumProcessors, setNumCapabilities)
+import Data.Time.Clock (UTCTime, getCurrentTime)
+import GHC.Conc (forkOn, getNumCapabilities, getNumProcessors, setNumCapabilities, threadWaitWrite)
 import GHC.IO.Exception (IOException (..))
 import qualified GHC.IO.Exception as IOException
-import Network.Socket (ServiceName)
+import Network.Socket (Family (AF_UNIX), ServiceName, Socket, SocketType (Stream), close, defaultProtocol, socketPair, unsafeFdSocket)
+import System.Posix.Types (Fd (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive, removeFile)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
@@ -130,7 +135,7 @@ instance Example a => Example (TestWrapper a) where
     where
       tt = 300
       runTest =
-        withTestEnv $
+        withTestEnv $ trackRunning label $
           timeout (tt * 1000000) (evaluateExample action params hooks state) `finally` callCommand "sync" >>= \case
             Just r -> pure r
             Nothing -> throwIO $ userError $ "test timed out after " <> show tt <> " seconds"
@@ -138,12 +143,14 @@ instance Example a => Example (TestWrapper a) where
       onTestFailure ci = \case
         Failure loc_ reason | ci -> do
           putStrLn $ "Test failed: " ++ show label ++ ", location " ++ show loc_ ++ ", reason: " ++ show reason
+          printProbe $ "failure of " <> show label
           retryTest
         r -> E.throwIO r
       onTestException :: Bool -> SomeException -> IO Result
       onTestException False e = E.throwIO e
       onTestException True e = do
         putStrLn $ "Test exception: " ++ show label ++ ", " ++ show e
+        printProbe $ "exception of " <> show label
         retryTest
       retryTest = do
         putStrLn "Retrying with more logs..."
@@ -152,6 +159,84 @@ instance Example a => Example (TestWrapper a) where
 
 envCI :: IO Bool
 envCI = (Just "true" ==) <$> lookupEnv "CI"
+
+runningTests :: TVar (M.Map Int (String, UTCTime))
+runningTests = unsafePerformIO $ newTVarIO M.empty
+{-# NOINLINE runningTests #-}
+
+trackRunning :: HasTestEnv => String -> IO a -> IO a
+trackRunning label =
+  bracket_
+    (getCurrentTime >>= \t -> atomically $ modifyTVar' runningTests $ M.insert (testNo ?testEnv) (label, t))
+    (atomically $ modifyTVar' runningTests $ M.delete (testNo ?testEnv))
+
+probeSockets :: [(Int, Fd, Socket)]
+probeSockets = unsafePerformIO $ collect IM.empty
+  where
+    collect m
+      | IM.size m == 32 = pure [(b, fd, s) | (b, (fd, s)) <- IM.toList m]
+      | otherwise = do
+          (s1, s2) <- socketPair AF_UNIX Stream defaultProtocol
+          fds <- forM [s1, s2] $ \s -> (\fd -> (Fd fd, s)) <$> unsafeFdSocket s
+          collect $ foldl' (\m' p@(Fd fd, _) -> IM.insertWith (\_ old -> old) (fromIntegral fd .&. 31) p m') m fds
+{-# NOINLINE probeSockets #-}
+
+probeIOManagers :: IO [(Int, [Int])]
+probeIOManagers = do
+  n <- getNumCapabilities
+  vs <- forM [(k, b, fd) | k <- [0 .. n - 1], (b, fd, _) <- probeSockets] $ \(k, b, fd) -> do
+    v <- newEmptyMVar
+    _ <- forkOn k $ (timeout 2000000 (threadWaitWrite fd) >>= putMVar v . (Just () ==)) `E.catch` \(_ :: SomeException) -> putMVar v False
+    pure (k, b, v)
+  rs <- forM vs $ \(k, b, v) -> (\r -> (k, b, r == Just True)) <$> timeout 5000000 (takeMVar v)
+  pure [(k, bs) | k <- [0 .. n - 1], let bs = [b | (k', b, ok) <- rs, k' == k, not ok], not (null bs)]
+
+printProbe :: String -> IO ()
+printProbe event = do
+  r <- probeIOManagers
+  ts <- getCurrentTime
+  running <- readTVarIO runningTests
+  putStrLn $ "IO manager probe at " <> event <> ", " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", running " <> show (M.toList running)
+
+ioManagerCloseStress :: IO ()
+ioManagerCloseStress = do
+  n <- getNumCapabilities
+  r0 <- probeIOManagers
+  putStrLn $ "IO manager close stress: " <> show n <> " capabilities, blocked before " <> show r0
+  registrars <- forM [0 .. 4 * n - 1] $ \i -> forkOn (i `mod` n) $ forever $ mapM_ (\(_, fd, _) -> threadWaitWrite fd) probeSockets
+  interrupted <- newTVarIO (0 :: Int)
+  forM_ ([1 .. 20] :: [Int]) $ \round_ -> do
+    replicateConcurrently_ 16 $ replicateM_ 250 $ do
+      (s1, s2) <- socketPair AF_UNIX Stream defaultProtocol
+      done <- newEmptyMVar
+      t <- E.mask_ $ forkIO $ (close s1 >> close s2 >> putMVar done True) `E.catch` \(_ :: SomeException) -> putMVar done False
+      killThread t
+      ok <- takeMVar done
+      when (not ok) $ atomically $ modifyTVar' interrupted (+ 1)
+    r <- probeIOManagers
+    c <- readTVarIO interrupted
+    putStrLn $ "IO manager close stress: round " <> show round_ <> ", closes interrupted " <> show c <> ", blocked (capability, buckets) " <> show r
+  mapM_ killThread registrars
+  r1 <- probeIOManagers
+  putStrLn $ "IO manager close stress: blocked after " <> show r1
+
+ioManagerMonitor :: IO ()
+ioManagerMonitor = do
+  r0 <- probeIOManagers
+  putStrLn $ "IO manager probe started: " <> show (length probeSockets) <> " buckets, blocked " <> show r0
+  loop r0
+  where
+    loop prev = do
+      threadDelay 2000000
+      r <- probeIOManagers
+      if r == prev
+        then loop r
+        else do
+          ts <- getCurrentTime
+          running <- readTVarIO runningTests
+          r' <- probeIOManagers
+          putStrLn $ "IO manager probe changed at " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", second probe " <> show r' <> ", running " <> show (M.toList running)
+          loop r'
 
 it :: (HasCallStack, Example a) => String -> (HasTestEnv => a) -> SpecWith (Arg a)
 it label action = Hspec.it label (TestWrapper label action)
