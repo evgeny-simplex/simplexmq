@@ -57,7 +57,7 @@ import Simplex.Messaging.Transport (CertChainPubKey (..), TLS (..), TransportPee
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), connectTraceVar, defaultTransportClientConfig, runTLSTransportClient)
 import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..))
 import qualified Simplex.Messaging.Transport.HTTP2.Client as HC
-import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential, runLocalTCPServer)
+import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential, newSocketState, runTCPServerSocket, startTCPServer)
 import Simplex.Messaging.Transport.Shared (ChainCertificates (..), chainIdCaCerts)
 import Simplex.Messaging.Util (unlessM)
 import Simplex.Messaging.Version (mkVersionRange)
@@ -281,7 +281,7 @@ testCancelledClientConnect = do
   atomically $ modifyTVar' connectTraces $ M.insert n trace
   flip finally (atomically $ modifyTVar' connectTraces $ M.delete n) $
     serverBracket
-      ( \started -> runLocalTCPServer started xftpTestPort $ \sock -> do
+      ( \started -> newSocketState >>= \ss -> runTCPServerSocket ss started (startTCPServer started (Just "127.0.0.1") xftpTestPort >>= \lsock -> unsafeFdSocket lsock >>= \lfd -> lsock <$ putStrLn ("testCancelledClientConnect " <> show n <> ": listening fd " <> show lfd <> " (bucket " <> show (lfd `mod` 32) <> ")")) $ \sock -> do
           fd <- unsafeFdSocket sock
           log_ $ "server accepted fd " <> show fd <> " (bucket " <> show (fd `mod` 32) <> ")"
           void $ atomically $ tryPutTMVar accepted ()

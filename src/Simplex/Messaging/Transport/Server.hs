@@ -27,6 +27,7 @@ module Simplex.Messaging.Transport.Server
     runTransportServer,
     runTransportServerSocket,
     runLocalTCPServer,
+    runTCPServerSocket,
     startTCPServer,
     loadServerCredential,
     loadCredential,
