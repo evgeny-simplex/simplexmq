@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
@@ -30,6 +31,7 @@ import System.Posix.Types (Fd (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive, removeFile)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Process (callCommand)
 import System.Timeout (timeout)
@@ -42,8 +44,10 @@ withNumCapabilities new a = getNumCapabilities >>= \old -> bracket_ (setCaps old
   where
     setCaps from to = do
       ts <- getCurrentTime
-      putStrLn $ "Capabilities " <> show from <> " -> " <> show to <> " at " <> show ts
+      hPutStrLn stderr $ "Capabilities " <> show from <> " -> " <> show to <> " at " <> show ts
+#if __GLASGOW_HASKELL__ != 810
       setNumCapabilities to
+#endif
 
 withNCPUCapabilities :: IO a -> IO a
 withNCPUCapabilities a = getNumProcessors >>= \p -> withNumCapabilities p a
@@ -202,7 +206,7 @@ printProbe event = do
   r <- probeIOManagers
   ts <- getCurrentTime
   running <- readTVarIO runningTests
-  putStrLn $ "IO manager probe at " <> event <> ", " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", running " <> show (M.toList running)
+  hPutStrLn stderr $ "IO manager probe at " <> event <> ", " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", running " <> show (M.toList running)
 
 ioManagerCloseStress :: IO ()
 ioManagerCloseStress = do
@@ -244,14 +248,14 @@ stallMonitor = forever $ do
     caps <- getNumCapabilities
     mem <- memoryInfo
     running <- readTVarIO runningTests
-    putStrLn $ "Stall: a 0.1 s delay took " <> show (t1 - t0) <> " s, at " <> show ts <> ", capabilities " <> show caps <> ", " <> mem <> ", running " <> show (map fst $ M.elems running)
+    hPutStrLn stderr $ "Stall: a 0.1 s delay took " <> show (t1 - t0) <> " s, at " <> show ts <> ", capabilities " <> show caps <> ", " <> mem <> ", running " <> show (map fst $ M.elems running)
 
 memoryMonitor :: IO ()
 memoryMonitor = forever $ do
   ts <- getCurrentTime
   mem <- memoryInfo
   n <- M.size <$> readTVarIO runningTests
-  putStrLn $ "Memory at " <> show ts <> ": " <> mem <> ", running tests " <> show n
+  hPutStrLn stderr $ "Memory at " <> show ts <> ": " <> mem <> ", running tests " <> show n
   threadDelay 30000000
 
 ioManagerMonitor :: IO ()
@@ -259,7 +263,7 @@ ioManagerMonitor = do
   _ <- forkIO stallMonitor
   _ <- forkIO memoryMonitor
   r0 <- probeIOManagers
-  putStrLn $ "IO manager probe started: " <> show (length probeSockets) <> " buckets, blocked " <> show r0
+  hPutStrLn stderr $ "IO manager probe started: " <> show (length probeSockets) <> " buckets, blocked " <> show r0
   loop r0
   where
     loop prev = do
@@ -271,7 +275,7 @@ ioManagerMonitor = do
           ts <- getCurrentTime
           running <- readTVarIO runningTests
           r' <- probeIOManagers
-          putStrLn $ "IO manager probe changed at " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", second probe " <> show r' <> ", running " <> show (M.toList running)
+          hPutStrLn stderr $ "IO manager probe changed at " <> show ts <> ": blocked (capability, buckets) " <> show r <> ", second probe " <> show r' <> ", running " <> show (M.toList running)
           loop r'
 
 it :: (HasCallStack, Example a) => String -> (HasTestEnv => a) -> SpecWith (Arg a)

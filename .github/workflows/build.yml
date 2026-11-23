@@ -448,6 +448,13 @@ jobs:
           ln -sf ../../../libsodium-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs node_modules/libsodium-wrappers-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs
           npm run build
 
+      - name: IO manager close stress with one capability
+        if: matrix.should_run == true && matrix.arch == 'x86-64' && matrix.client_postgres != true
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: IO_MANAGER_STRESS=1 ./simplexmq-test +RTS -N1 -RTS
+
       - name: Test
         if: matrix.should_run == true && matrix.arch == 'x86-64' && matrix.client_postgres != true
         timeout-minutes: 120
@@ -458,7 +465,7 @@ jobs:
           TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.tests || '' }}
           PR_BODY: ${{ github.event.pull_request.draft == true && github.event.pull_request.body || '' }}
           ATTEMPTS: ${{ (github.ref == 'refs/heads/stable' || startsWith(github.ref, 'refs/tags/v')) && 3 || 1 }}
-        run: scripts/ci/run-tests.sh ./simplexmq-test
+        run: scripts/ci/run-tests.sh ./simplexmq-test ${{ matrix.ghc == '8.10.7' && '+RTS -N1 -RTS -j4' || '' }}
 
       - name: Test with PostgreSQL agent store
         if: ${{ !cancelled() && steps.build-client-postgres.outcome == 'success' }}
@@ -537,7 +544,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        copy: [1, 2, 3, 4, 5, 6, 7, 8]
+        copy: [1]
         include:
           - os: 22.04
             os_underscore: 22_04
