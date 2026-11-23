@@ -25,11 +25,11 @@ import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import qualified Data.CaseInsensitive as CI
 import Data.Either (isLeft)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find, isInfixOf)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.Map.Strict as M
-import Data.Time.Clock (UTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import GHC.Conc (threadStatus)
 import Network.Socket (unsafeFdSocket)
 import Network.Socket.ByteString (recv)
@@ -290,7 +290,10 @@ testCancelledClientConnect = do
           void $ atomically $ tryPutTMVar closed ()
       )
       (pure ())
-      $ \srvTid -> forM_ ([1 .. 1000] :: [Int]) $ \i -> do
+      $ \srvTid -> do
+       stats <- newIORef (0 :: Double, 0 :: Int, 0 :: Int)
+       t00 <- getCurrentTime
+       forM_ ([1 .. 1000] :: [Int]) $ \i -> do
         writeIORef trace []
         ts <- getCurrentTime
         a <- async $ getXFTPClient (1, testXFTPServer, Nothing) testXFTPClientConfig [] ts (\_ -> pure Nothing) (\_ -> pure ())
@@ -299,6 +302,8 @@ testCancelledClientConnect = do
               timeout 5000000 act >>= \case
                 Just _ -> pure $ Just ()
                 Nothing -> do
+                  st <- readIORef stats
+                  putStrLn $ "testCancelledClientConnect " <> show n <> ": started at " <> show t00 <> ", iteration " <> show i <> " started at " <> show ts <> ", (max iteration s, iterations over 0.1 s, over 1 s) " <> show st
                   report n i name a srvTid trace
                   r' <- timeout 30000000 act
                   t <- getCurrentTime
@@ -308,6 +313,12 @@ testCancelledClientConnect = do
         step "accepted" (atomically $ takeTMVar accepted) `shouldReturn` Just ()
         step "cancel" (cancel a) `shouldReturn` Just ()
         step "closed" (atomically $ takeTMVar closed) `shouldReturn` Just ()
+        te <- getCurrentTime
+        let d = realToFrac (diffUTCTime te ts) :: Double
+        modifyIORef' stats $ \(mx, s1, s2) -> (max mx d, s1 + fromEnum (d > 0.1), s2 + fromEnum (d > 1))
+       t01 <- getCurrentTime
+       st <- readIORef stats
+       putStrLn $ "testCancelledClientConnect " <> show n <> ": 1000 iterations in " <> show (diffUTCTime t01 t00) <> ", (max iteration s, iterations over 0.1 s, over 1 s) " <> show st
   where
     report :: Int -> Int -> String -> Async (Either XFTPClientError XFTPClient) -> ThreadId -> IORef [(UTCTime, ThreadId, String)] -> IO ()
     report n i name a srvTid trace = do

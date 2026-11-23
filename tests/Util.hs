@@ -17,10 +17,11 @@ import Control.Monad (forM, forM_, forever, replicateM, replicateM_, when)
 import Data.Bits ((.&.))
 import Data.Either (partitionEithers)
 import qualified Data.IntMap.Strict as IM
-import Data.List (foldl', tails)
+import Data.List (foldl', isPrefixOf, tails)
 import qualified Data.Map.Strict as M
 import Data.String (IsString (..))
 import Data.Time.Clock (UTCTime, getCurrentTime)
+import GHC.Clock (getMonotonicTime)
 import GHC.Conc (forkOn, getNumCapabilities, getNumProcessors, setNumCapabilities, threadWaitWrite)
 import GHC.IO.Exception (IOException (..))
 import qualified GHC.IO.Exception as IOException
@@ -37,7 +38,12 @@ import qualified Test.Hspec as Hspec
 import Test.Hspec.Core.Spec (Example (..), Result (..), ResultStatus (..))
 
 withNumCapabilities :: Int -> IO a -> IO a
-withNumCapabilities new a = getNumCapabilities >>= \old -> bracket_ (setNumCapabilities new) (setNumCapabilities old) a
+withNumCapabilities new a = getNumCapabilities >>= \old -> bracket_ (setCaps old new) (setCaps new old) a
+  where
+    setCaps from to = do
+      ts <- getCurrentTime
+      putStrLn $ "Capabilities " <> show from <> " -> " <> show to <> " at " <> show ts
+      setNumCapabilities to
 
 withNCPUCapabilities :: IO a -> IO a
 withNCPUCapabilities a = getNumProcessors >>= \p -> withNumCapabilities p a
@@ -220,8 +226,38 @@ ioManagerCloseStress = do
   r1 <- probeIOManagers
   putStrLn $ "IO manager close stress: blocked after " <> show r1
 
+memoryInfo :: IO String
+memoryInfo = do
+  st <- lines <$> readFile "/proc/self/status"
+  mi <- lines <$> readFile "/proc/meminfo"
+  let sel ks = filter (\l -> any (`isPrefixOf` l) ks)
+      s = unwords $ map (unwords . words) $ sel ["VmRSS", "VmSwap"] st <> sel ["MemAvailable", "SwapTotal", "SwapFree"] mi
+  length s `seq` pure s
+
+stallMonitor :: IO ()
+stallMonitor = forever $ do
+  t0 <- getMonotonicTime
+  threadDelay 100000
+  t1 <- getMonotonicTime
+  when (t1 - t0 > 1) $ do
+    ts <- getCurrentTime
+    caps <- getNumCapabilities
+    mem <- memoryInfo
+    running <- readTVarIO runningTests
+    putStrLn $ "Stall: a 0.1 s delay took " <> show (t1 - t0) <> " s, at " <> show ts <> ", capabilities " <> show caps <> ", " <> mem <> ", running " <> show (map fst $ M.elems running)
+
+memoryMonitor :: IO ()
+memoryMonitor = forever $ do
+  ts <- getCurrentTime
+  mem <- memoryInfo
+  n <- M.size <$> readTVarIO runningTests
+  putStrLn $ "Memory at " <> show ts <> ": " <> mem <> ", running tests " <> show n
+  threadDelay 30000000
+
 ioManagerMonitor :: IO ()
 ioManagerMonitor = do
+  _ <- forkIO stallMonitor
+  _ <- forkIO memoryMonitor
   r0 <- probeIOManagers
   putStrLn $ "IO manager probe started: " <> show (length probeSockets) <> " buckets, blocked " <> show r0
   loop r0

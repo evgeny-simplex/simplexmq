@@ -448,13 +448,6 @@ jobs:
           ln -sf ../../../libsodium-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs node_modules/libsodium-wrappers-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs
           npm run build
 
-      - name: IO manager close stress
-        if: matrix.should_run == true && matrix.arch == 'x86-64' && matrix.client_postgres != true
-        continue-on-error: true
-        timeout-minutes: 10
-        shell: bash
-        run: IO_MANAGER_STRESS=1 ./simplexmq-test
-
       - name: Test
         if: matrix.should_run == true && matrix.arch == 'x86-64' && matrix.client_postgres != true
         timeout-minutes: 120
@@ -532,7 +525,7 @@ jobs:
           key: ${{ steps.keys.outputs.dist }}-O0-${{ env.branch }}-${{ github.sha }}
 
   build-reduced:
-    name: "ubuntu-${{ matrix.os }}-${{ matrix.arch }}, GHC: ${{ matrix.ghc }}${{ matrix.client_postgres && ', PostgreSQL agent store' || '' }}"
+    name: "ubuntu-${{ matrix.os }}-${{ matrix.arch }}, GHC: ${{ matrix.ghc }}, copy ${{ matrix.copy }}"
     needs: maybe-release
     if: needs.maybe-release.outputs.reduced == 'true'
     permissions:
@@ -544,18 +537,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        copy: [1, 2, 3, 4, 5, 6, 7, 8]
         include:
           - os: 22.04
             os_underscore: 22_04
             arch: x86-64
             runner: "ubuntu-22.04"
             ghc: "8.10.7"
-            should_run: true
-          - os: 24.04
-            os_underscore: 24_04
-            arch: x86-64
-            runner: "ubuntu-24.04"
-            ghc: "9.6.3"
             should_run: true
     steps: *build-steps
 
