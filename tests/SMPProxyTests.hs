@@ -134,12 +134,12 @@ smpProxyTests = do
         it "100x100, 100ms" $ oneServer $ 100 `inParrallel` (randomRIO (0, 1000000) >>= threadDelay >> proxyConnectDeadRelay 100 100000 srv1)
     describe "agent API" $ do
       describe "one server" $ do
-        forM_ [1 :: Int .. 50] $ \i -> it ("always via proxy " <> show i) $ oneServer $
+        forM_ ([1 .. 50] :: [Int]) $ \i -> it ("always via proxy " <> show i) $ oneServer $
           agentDeliverMessageViaProxy ([srv1], SPMAlways, True) ([srv1], SPMAlways, True) C.SEd448 "hello 1" "hello 2" 1
         it "without proxy" $ oneServer $
           agentDeliverMessageViaProxy ([srv1], SPMNever, False) ([srv1], SPMNever, False) C.SEd448 "hello 1" "hello 2" 1
       describe "two servers" $ do
-        forM_ [1 :: Int .. 50] $ \i -> it ("always via proxy " <> show i) $ \msType -> twoServers
+        forM_ ([1 .. 50] :: [Int]) $ \i -> it ("always via proxy " <> show i) $ \msType -> twoServers
           (agentDeliverMessageViaProxy ([srv1], SPMAlways, True) ([srv2], SPMAlways, True) C.SEd448 "hello 1" "hello 2" 1)
           msType
         it "both via proxy" $ twoServers $
