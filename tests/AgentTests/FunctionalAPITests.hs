@@ -489,10 +489,8 @@ functionalAPITests ps = do
     it "should deliver a message again after the agent stops before acknowledging it and the server restarts" $
       testRedeliveryAfterStopBeforeAck True ps
     it "should send messages while an acknowledgement waits for space in the message queue" $ do
-      pendingWith "fixed in https://github.com/simplex-chat/simplexmq/pull/2079"
       withSmpServer ps testSendWhileAckWaitsForFullQueue
     it "should reconnect and receive messages when the connection stops forwarding" $ do
-      pendingWith "until the client closes a connection as soon as its pings time out"
       testReceiveAfterStalledConnection ps
     it "should report error via msg integrity on skipped messages" $
       testSkippedMessages ps
@@ -620,7 +618,6 @@ functionalAPITests ps = do
     it "should keep the switch to an offline peer started without pending work (expected: an error after a deadline)" $
       withSmpServer ps testSwitchOfflinePeer
     it "should complete the slow switch after deleteErrorCount failures to delete the old queue" $ do
-      pendingWith "until the agent stops deleting the old queue after deleteErrorCount temporary errors"
       testSlowSwitchStoppedOldServer ps
     describe "should switch delivery to the new queue" $
       testServerMatrix2 ps testSwitchConnection

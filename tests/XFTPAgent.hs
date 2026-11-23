@@ -106,10 +106,8 @@ xftpAgentTests =
       it "should report NO_FILE when file is deleted from database during download" $ \_ -> testXFTPAgentDeleteDuringDownload
       it "should request additional recipient IDs when number of recipients exceeds maximum per request" testXFTPAgentRequestAdditionalRecipientIDs
       it "should keep the recipients of a chunk when its upload is retried" $ \_ -> do
-        pendingWith "until the agent reads the chunk replica again before each upload attempt"
         testXFTPAgentRetryUploadRecipients
       it "should end a slow download with RFDONE or RFERR in bounded time" $ \_ -> do
-        pendingWith "until the agent sends RFERR when it stops a download"
         testXFTPAgentSlowDownload
       it "should complete sending file while agent is suspending" testXFTPAgentSuspendSending
       it "should suspend on timeout when file is not sent" $ \_ -> testXFTPAgentSuspendTimeout
