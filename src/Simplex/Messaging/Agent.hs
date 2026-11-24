@@ -1189,13 +1189,13 @@ createRcvQueue c nm userId connId srvWithAuth@(ProtoServerWithAuth srv _) enable
     newRcvQueue_ c nm userId connId srvWithAuth vr qd (isJust ntfServer_) subMode nonce_ e2eKeys
       `catchAllErrors` \e -> liftIO (print e) >> throwE e
   incSMPServerStat c userId srv connCreated
-  rq' <- recordNewQueue c nm connId "createRcvQueue" tSess rq (withStore c $ \db -> updateNewConnRcv db connId rq subMode) $ \rq' ->
+  rq' <- recordNewQueue c nm "createRcvQueue" tSess rq (withStore c $ \db -> updateNewConnRcv db connId rq subMode) $ \rq' ->
     rq' <$ lift (when (subMode == SMSubscribe) $ addNewQueueSubscription c rq' tSess sessId serviceId_)
   mapM_ (newQueueNtfSubscription c rq') ntfServer_
   pure (rq', qUri)
 
-recordNewQueue :: AgentClient -> NetworkRequestMode -> ConnId -> Text -> SMPTransportSession -> NewRcvQueue -> AM r -> (r -> AM a) -> AM a
-recordNewQueue c nm connId name tSess q record continue = do
+recordNewQueue :: AgentClient -> NetworkRequestMode -> Text -> SMPTransportSession -> NewRcvQueue -> AM r -> (r -> AM a) -> AM a
+recordNewQueue c nm name tSess q@RcvQueue {connId} record continue = do
   recorded <- withConnLock c connId name $ tryAllErrors record >>= mapM continue
   either (\e -> tryAllErrors (deleteNewQueue c nm tSess q) >> throwE e) pure recorded
 
@@ -1738,7 +1738,7 @@ createReplyQueue c nm ConnData {userId, connId, enableNtfs} SndQueue {smpClientV
   (rq, qUri, tSess, sessId, serviceId_) <- newRcvQueue c nm userId connId srv (versionToRange smpClientVersion) SCMInvitation (isJust ntfServer_) subMode
   incSMPServerStat c userId (qServer rq) connCreated
   let qInfo = toVersionT qUri smpClientVersion
-  rq' <- recordNewQueue c nm connId "createReplyQueue" tSess rq (withStore c $ \db -> upgradeSndConnToDuplex db connId rq subMode) $ \rq' ->
+  rq' <- recordNewQueue c nm "createReplyQueue" tSess rq (withStore c $ \db -> upgradeSndConnToDuplex db connId rq subMode) $ \rq' ->
     rq' <$ lift (when (subMode == SMSubscribe) $ addNewQueueSubscription c rq' tSess sessId serviceId_)
   mapM_ (newQueueNtfSubscription c rq') ntfServer_
   pure qInfo
@@ -2324,7 +2324,7 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
           noServer . tryAtomicCommand $ do
             (conn, replaced, switchId) <- withConnLock c connId "switchConnection" startSwitch
             switchDuplexConnection c NRMBackground (Just cmdId) switchId conn replaced `allFinally` endRcvSwitch c connId switchId
-              >>= notify . SWITCH QDRcv SPStarted
+              >>= maybe (withStore' c (`deleteCommand` cmdId)) (notify . SWITCH QDRcv SPStarted)
           where
             startSwitch :: AM (Connection 'CDuplex, RcvQueue, Unique)
             startSwitch =
@@ -2453,7 +2453,7 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
               withStore' c $ \db -> deleteConnRcvQueue db rq' >> deleteCommand db cmdId
               when enableNtfs $ do
                 ns <- asks ntfSupervisor
-                liftIO $ sendNtfSubCommand ns (NSCCreate, [connId])
+                liftIO . whenM (hasInstantNotifications ns) $ nonBlockingWriteTBQueue (ntfSubQ ns) (NSCCreate, [connId])
               let conn' = DuplexConnection cData rqs sqs
               cStats <- connectionStats c conn'
               notify $ SWITCH QDRcv SPCompleted cStats
@@ -2524,10 +2524,10 @@ runCommandProcessing c@AgentClient {subQ} connId server_ Worker {doWork} = do
         cmdError e = notify (ERR e) >> withStore' c (`deleteCommand` cmdId)
         postponeCommand srv = do
           liftIO $ noWorkToDo doWork
-          otherCmds <- withStore c $ \db -> runExceptT $ do
-            liftIO $ deleteCommand db cmdId
-            pending <- liftIO $ hasNonQSecureCommand db connId srv
-            pending <$ ExceptT (createCommand db corrId connId server_ command)
+          otherCmds <- withStore c $ \db -> do
+            deleteCommand db cmdId
+            pending <- hasNonQSecureCommand db connId srv
+            (pending <$) <$> createCommand db corrId connId server_ command
           when otherCmds . atomically $ hasWorkToDo' doWork
         notify :: forall e. AEntityI e => AEvent e -> AM ()
         notify cmd =
@@ -2913,15 +2913,13 @@ ackMessage' c cmdId_ connId msgId rcptInfo_ =
     markConnUserAck :: AM (Maybe (Maybe (Connection 'CDuplex), RcvQueue, SMP.MsgId))
     markConnUserAck = do
       SomeConn _ conn <- withStore c (`getConn` connId)
-      case conn of
-        DuplexConnection {} -> markUserAck $ Just conn
-        RcvConnection {} -> markUserAck Nothing
+      duplexConn_ <- case conn of
+        DuplexConnection {} -> pure $ Just conn
+        RcvConnection {} -> pure Nothing
         SndConnection {} -> throwE $ CONN SIMPLEX "ackMessage"
         ContactConnection {} -> throwE $ CMD PROHIBITED "ackMessage: ContactConnection"
         NewConnection _ -> throwE $ CMD PROHIBITED "ackMessage: NewConnection"
-    -- the stored message was delivered via a specific queue, the rest failed to decrypt and were already acknowledged
-    markUserAck :: Maybe (Connection 'CDuplex) -> AM (Maybe (Maybe (Connection 'CDuplex), RcvQueue, SMP.MsgId))
-    markUserAck duplexConn_ =
+      -- the stored message was delivered via a specific queue, the rest failed to decrypt and were already acknowledged
       withStore' c (\db -> setMsgUserAck db connId $ InternalId msgId) >>= \case
         Right (rq, srvMsgId) -> pure $ Just (duplexConn_, rq, srvMsgId)
         Left (SEMsgNotFound _) -> Nothing <$ del
@@ -2965,6 +2963,7 @@ switchConnection' c nm connId = do
             (cData, rqs, sqs, rq',) <$> newRcvSwitch c connId
       _ -> throwE $ CMD PROHIBITED "switchConnection: not duplex"
   switchDuplexConnection c nm Nothing switchId (DuplexConnection cData rqs sqs) rq' `allFinally` endRcvSwitch c connId switchId
+    >>= maybe (throwE $ CMD PROHIBITED "switchConnection: aborted") pure
 
 newRcvSwitch :: AgentClient -> ConnId -> AM Unique
 newRcvSwitch c connId = do
@@ -2974,7 +2973,7 @@ newRcvSwitch c connId = do
 endRcvSwitch :: AgentClient -> ConnId -> Unique -> AM ()
 endRcvSwitch c connId switchId = atomically $ TM.alter (mfilter (/= switchId)) connId $ rcvSwitches c
 
-switchDuplexConnection :: AgentClient -> NetworkRequestMode -> Maybe AsyncCmdId -> Unique -> Connection 'CDuplex -> RcvQueue -> AM ConnectionStats
+switchDuplexConnection :: AgentClient -> NetworkRequestMode -> Maybe AsyncCmdId -> Unique -> Connection 'CDuplex -> RcvQueue -> AM (Maybe ConnectionStats)
 switchDuplexConnection c nm cmdId_ switchId (DuplexConnection ConnData {connId, userId} rqs sqs) rq@RcvQueue {server, dbQueueId = DBEntityId dbQueueId, sndId} = do
   checkRQSwchStatus rq RSSwitchStarted
   clientVRange <- asks $ smpClientVRange . config
@@ -2990,17 +2989,19 @@ switchDuplexConnection c nm cmdId_ switchId (DuplexConnection ConnData {connId, 
           SomeConn _ (DuplexConnection cData rqs' sqs') | Just rq1 <- findQ (qAddress rq) rqs' ->
             (cData,rqs',sqs',rq1,) <$> withStore c (\db -> addConnRcvQueue db connId rq' SMSubscribe)
           _ -> throwE $ INTERNAL "switchConnection: replaced queue not found in connection"
-  recordNewQueue c nm connId "switchConnection" tSess q addRcvQueue $ \(cData, rqs', sqs', rq1, rq'') -> do
+  recordNewQueue c nm "switchConnection" tSess q addRcvQueue $ \(cData, rqs', sqs', rq1, rq'') -> do
     started <- (Just switchId ==) <$> liftIO (TM.lookupIO connId $ rcvSwitches c)
-    when (rcvSwchStatus rq1 /= Just RSSwitchStarted || not started) $ deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: aborted")
-    when (ratchetSyncSendProhibited cData) $ do
-      void $ withStore' c $ \db -> setRcvSwitchStatus db rq1 Nothing
-      deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: send prohibited")
-    lift $ addNewQueueSubscription c rq'' tSess sessId serviceId_
-    void . enqueueMessages c cData sqs' SMP.noMsgFlags $ QADD [(qUri, Just (server, sndId))]
-    rq1' <- withStore' c $ \db -> setRcvSwitchStatus db rq1 (Just RSSendingQADD) <* mapM_ (deleteCommand db) cmdId_
-    let rqs'' = updatedQs rq1' rqs' <> [rq'']
-    connectionStats c $ DuplexConnection cData rqs'' sqs'
+    if rcvSwchStatus rq1 /= Just RSSwitchStarted || not started
+      then Nothing <$ deleteRcvQueueAsync c rq''
+      else do
+        when (ratchetSyncSendProhibited cData) $ do
+          void $ withStore' c $ \db -> setRcvSwitchStatus db rq1 Nothing
+          deleteRcvQueueAsync c rq'' >> throwE (CMD PROHIBITED "switchConnection: send prohibited")
+        lift $ addNewQueueSubscription c rq'' tSess sessId serviceId_
+        void . enqueueMessages c cData sqs' SMP.noMsgFlags $ QADD [(qUri, Just (server, sndId))]
+        rq1' <- withStore' c $ \db -> setRcvSwitchStatus db rq1 (Just RSSendingQADD) <* mapM_ (deleteCommand db) cmdId_
+        let rqs'' = updatedQs rq1' rqs' <> [rq'']
+        Just <$> connectionStats c (DuplexConnection cData rqs'' sqs')
 
 abortConnectionSwitch' :: AgentClient -> ConnId -> AM ConnectionStats
 abortConnectionSwitch' c connId =
@@ -3093,7 +3094,6 @@ suspendConnection' c nm connId = do
   mapM_ (suspendQueue c nm) (rqs :: [RcvQueue])
 
 -- | Delete SMP agent connection (DEL command) in Reader monad
--- unlike deleteConnectionAsync, this function does not mark connection as deleted in case of deletion failure
 -- currently it is used only in tests
 deleteConnection' :: AgentClient -> NetworkRequestMode -> ConnId -> AM ()
 deleteConnection' c nm connId = toConnResult connId =<< deleteConnections' c nm [connId]
@@ -3107,7 +3107,6 @@ connRcvQueues = \case
   SndConnection _ _ -> []
   NewConnection _ -> []
 
--- Unlike deleteConnectionsAsync, this function does not mark connections as deleted in case of deletion failure.
 deleteConnections' :: AgentClient -> NetworkRequestMode -> [ConnId] -> AM (Map ConnId (Either AgentErrorType ()))
 deleteConnections' = deleteConnections_ getConns False False
 {-# INLINE deleteConnections' #-}
@@ -3212,7 +3211,10 @@ deleteConnections_ ::
   AM (Map ConnId (Either AgentErrorType ()))
 deleteConnections_ _ _ _ _ _ [] = pure M.empty
 deleteConnections_ getConnections ntf waitDelivery c nm connIds = do
-  (rs, rqs, _) <- ExceptT . withConnLocks c (S.fromList connIds) "deleteConnections" . runExceptT $ prepareDeleteConnections_ getConnections c waitDelivery connIds
+  (rs, rqs, _) <- ExceptT . withConnLocks c (S.fromList connIds) "deleteConnections" . runExceptT $ do
+    r@(_, _, connIds') <- prepareDeleteConnections_ getConnections c waitDelivery connIds
+    unless waitDelivery . withStore' c $ \db -> forM_ connIds' $ setConnDeleted db False
+    pure r
   rcvRs <- lift $ deleteConnQueues c nm waitDelivery ntf rqs
   let rs' = M.union rs rcvRs
   notifyResultError rs'
@@ -4305,7 +4307,7 @@ processSMPTransmissions c@AgentClient {subQ, smpServersStats} (tSess@(userId, sr
                 unless completed $ do
                   when enableNtfs $ do
                     ns <- asks ntfSupervisor
-                    liftIO $ sendNtfSubCommand ns (NSCCreate, [connId])
+                    liftIO . whenM (hasInstantNotifications ns) $ nonBlockingWriteTBQueue (ntfSubQ ns) (NSCCreate, [connId])
                   let conn' = DuplexConnection cData' (keptRq :| keptRqs) sqs
                   cStats <- connectionStats c conn'
                   notify $ SWITCH QDRcv SPCompleted cStats

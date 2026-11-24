@@ -158,7 +158,7 @@ import qualified Data.Map.Strict as M
 import Data.Maybe (catMaybes, fromMaybe, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time.Clock (NominalDiffTime, UTCTime (..), diffUTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime (..), diffUTCTime, getCurrentTime)
 import qualified Data.X509 as X
 import qualified Data.X509.Validation as XV
 import Network.Socket (HostName, ServiceName)
@@ -483,7 +483,6 @@ data ProtocolClientConfig v = ProtocolClientConfig
     defaultTransport :: (ServiceName, ATransport 'TClient),
     -- | network configuration
     networkConfig :: NetworkConfig,
-    sentCommandsTTL :: NominalDiffTime,
     clientALPN :: Maybe [ALPN],
     serviceCredentials :: Maybe ServiceCredentials,
     -- | client-server protocol version range
@@ -504,7 +503,6 @@ defaultClientConfig clientALPN useSNI serverVRange =
     { qSize = 64,
       defaultTransport = ("443", transport @TLS),
       networkConfig = defaultNetworkConfig,
-      sentCommandsTTL = 15 * 60,
       clientALPN,
       serviceCredentials = Nothing,
       serverVRange,
@@ -528,7 +526,6 @@ data Request err msg = Request
   { corrId :: CorrId,
     entityId :: EntityId,
     command :: ProtoCommand msg,
-    createdAt :: UTCTime,
     pending :: TVar Bool,
     responseVar :: TMVar (Either (ProtocolClientError err) msg)
   }
@@ -584,7 +581,7 @@ type SMPTransportSession = TransportSession BrokerMsg
 -- A single queue can be used for multiple 'SMPClient' instances,
 -- as 'SMPServerTransmission' includes server information.
 getProtocolClient :: forall v err msg. Protocol v err msg => TVar ChaChaDRG -> NetworkRequestMode -> TransportSession msg -> ProtocolClientConfig v -> [HostName] -> Maybe (TBQueue (ServerTransmissionBatch v err msg)) -> UTCTime -> (ProtocolClient v err msg -> IO ()) -> IO (Either (ProtocolClientError err) (ProtocolClient v err msg))
-getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qSize, networkConfig, sentCommandsTTL, clientALPN, serviceCredentials, serverVRange, proxiedRelayVRange, agreeSecret, proxyServer, useSNI} presetDomains msgQ proxySessTs disconnected = do
+getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qSize, networkConfig, clientALPN, serviceCredentials, serverVRange, proxiedRelayVRange, agreeSecret, proxyServer, useSNI} presetDomains msgQ proxySessTs disconnected = do
   case chooseTransportHost networkConfig (host srv) of
     Right useHost ->
       (getCurrentTime >>= mkProtocolClient useHost >>= runClient useTransport useHost)
@@ -686,14 +683,12 @@ getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qS
       atomically $ writeTVar timeoutErrorCount 0
 
     monitor :: ProtocolClient v err msg -> IO ()
-    monitor c@ProtocolClient {client_ = PClient {sendPings, lastReceived, timeoutErrorCount, sentCommands}} = loop smpPingInterval
+    monitor c@ProtocolClient {client_ = PClient {sendPings, lastReceived, timeoutErrorCount}} = loop smpPingInterval
       where
         loop :: Int64 -> IO ()
         loop delay = do
           threadDelay' delay
-          ts <- getCurrentTime
-          atomically $ modifyTVar' sentCommands $ M.filter $ \Request {createdAt} -> diffUTCTime ts createdAt < sentCommandsTTL
-          diff <- diffUTCTime ts <$> readTVarIO lastReceived
+          diff <- diffUTCTime <$> getCurrentTime <*> readTVarIO lastReceived
           let idle = diffToMicroseconds diff
               remaining = smpPingInterval - idle
           if remaining > 1_000_000 -- delay pings only for significant time
@@ -723,15 +718,18 @@ getProtocolClient g nm transportSession@(_, srv, _) cfg@ProtocolClientConfig {qS
           TM.lookupIO corrId sentCommands >>= \case
             Nothing -> sendMsg $ STUnexpectedError unexpected
             Just Request {entityId, command, pending, responseVar} -> do
+              let resp = if entityId == entId then clientResp else Left unexpected
               wasPending <-
                 atomically $ do
                   TM.delete corrId sentCommands
                   ifM
                     (swapTVar pending False)
-                    (True <$ tryPutTMVar responseVar (if entityId == entId then clientResp else Left unexpected))
+                    (True <$ tryPutTMVar responseVar resp)
                     (pure False)
               if wasPending
-                then pure Nothing
+                then pure $ case resp of
+                  Right r | responseEvent r -> Just (entId, STEvent resp)
+                  _ -> Nothing
                 else sendMsg $ if entityId == entId then STResponse command clientResp else STUnexpectedError unexpected
       where
         unexpected = unexpectedResponse respOrErr
@@ -873,36 +871,33 @@ createSMPQueue c nm nonce_ (rKey, rpKey) dhKey auth subMode qrd ntfCreds =
 subscribeSMPQueue :: SMPClient -> RcvPrivateAuthKey -> RecipientId -> ExceptT SMPClientError IO (Maybe ServiceId)
 subscribeSMPQueue c rpKey rId = do
   liftIO $ enablePings c
-  sendSMPCommand c NRMBackground (Just rpKey) rId SUB >>= liftIO . processSUBResponse_ c rId >>= except
+  sendSMPCommand c NRMBackground (Just rpKey) rId SUB >>= except . processSUBResponse_
 
 -- | Subscribe to multiple SMP queues batching commands if supported.
 -- This command is always sent in background request mode
 subscribeSMPQueues :: SMPClient -> NonEmpty (RecipientId, RcvPrivateAuthKey) -> IO (NonEmpty (Either SMPClientError (Maybe ServiceId)))
 subscribeSMPQueues c qs = do
   liftIO $ enablePings c
-  sendProtocolCommands c NRMBackground cs >>= mapM (processSUBResponse c)
+  L.map processSUBResponse <$> sendProtocolCommands c NRMBackground cs
   where
     cs = L.map (\(rId, rpKey) -> (rId, Just rpKey, Cmd SRecipient SUB)) qs
 
 -- This command is always sent in background request mode
 streamSubscribeSMPQueues :: SMPClient -> NonEmpty (RecipientId, RcvPrivateAuthKey) -> ([(RecipientId, Either SMPClientError (Maybe ServiceId))] -> IO ()) -> IO ()
-streamSubscribeSMPQueues c qs cb = streamProtocolCommands c NRMBackground cs $ mapM process >=> cb
+streamSubscribeSMPQueues c qs cb = streamProtocolCommands c NRMBackground cs $ cb . map process
   where
     cs = L.map (\(rId, rpKey) -> (rId, Just rpKey, Cmd SRecipient SUB)) qs
-    process r@(Response rId _) = (rId,) <$> processSUBResponse c r
+    process r@(Response rId _) = (rId, processSUBResponse r)
 
-processSUBResponse :: SMPClient -> Response ErrorType BrokerMsg -> IO (Either SMPClientError (Maybe ServiceId))
-processSUBResponse c (Response rId r) = pure r $>>= processSUBResponse_ c rId
+processSUBResponse :: Response ErrorType BrokerMsg -> Either SMPClientError (Maybe ServiceId)
+processSUBResponse (Response _ r) = r >>= processSUBResponse_
 
-processSUBResponse_ :: SMPClient -> RecipientId -> BrokerMsg -> IO (Either SMPClientError (Maybe ServiceId))
-processSUBResponse_ c rId = \case
-  OK -> pure $ Right Nothing
-  SOK serviceId_ -> pure $ Right serviceId_
-  cmd@MSG {} -> writeSMPMessage c rId cmd $> Right Nothing
-  r' -> pure . Left $ unexpectedResponse r'
-
-writeSMPMessage :: SMPClient -> RecipientId -> BrokerMsg -> IO ()
-writeSMPMessage c rId msg = mapM_ (`nonBlockingWriteTBQueue` serverTransmission c [(rId, STEvent (Right msg))]) (msgQ $ client_ c)
+processSUBResponse_ :: BrokerMsg -> Either SMPClientError (Maybe ServiceId)
+processSUBResponse_ = \case
+  OK -> Right Nothing
+  SOK serviceId_ -> Right serviceId_
+  MSG {} -> Right Nothing
+  r' -> Left $ unexpectedResponse r'
 
 serverTransmission :: ProtocolClient v err msg -> NonEmpty (RecipientId, ServerTransmission err msg) -> ServerTransmissionBatch v err msg
 serverTransmission ProtocolClient {thParams, client_ = PClient {transportSession}} ts = (transportSession, thParams, ts)
@@ -915,7 +910,7 @@ getSMPMessage :: SMPClient -> RcvPrivateAuthKey -> RecipientId -> ExceptT SMPCli
 getSMPMessage c rpKey rId =
   sendSMPCommand c NRMInteractive (Just rpKey) rId GET >>= \case
     OK -> pure Nothing
-    cmd@(MSG msg) -> liftIO (writeSMPMessage c rId cmd) $> Just msg
+    MSG msg -> pure $ Just msg
     r -> throwE $ unexpectedResponse r
 {-# INLINE getSMPMessage #-}
 
@@ -1118,7 +1113,7 @@ ackSMPMessage :: SMPClient -> RcvPrivateAuthKey -> QueueId -> MsgId -> ExceptT S
 ackSMPMessage c rpKey rId msgId =
   sendSMPCommand c NRMBackground (Just rpKey) rId (ACK msgId) >>= \case
     OK -> pure True
-    cmd@MSG {} -> liftIO (writeSMPMessage c rId cmd) $> False
+    MSG {} -> pure False
     r -> throwE $ unexpectedResponse r
 
 -- | Irreversibly suspend SMP queue.
@@ -1394,13 +1389,13 @@ sendProtocolCommand_ c@ProtocolClient {thParams = THandleParams {blockSize, serv
 sendBlock :: ProtocolClient v err msg -> [Request err msg] -> (Maybe (Request err msg), ByteString) -> IO a -> IO a
 sendBlock ProtocolClient {client_ = PClient {connected, sentCommands, sndQ, msgQ}} rs t getResponses =
   -- two separate "atomically" needed to avoid blocking
-  E.bracketOnError
-    (atomically $ ifM (readTVar connected) (mapM_ addRequest rs >> tryWriteTBQueue sndQ t) (True <$ mapM_ failRequest rs))
-    (\_ -> when (isNothing msgQ) $ atomically $ mapM_ removeRequest rs)
-    (\sent -> if sent then getResponses else withAsync (atomically $ writeTBQueue sndQ t) (const getResponses))
+  case msgQ of
+    Just _ -> send >>= get
+    Nothing -> E.bracketOnError send (\_ -> atomically $ forM_ rs $ \Request {corrId} -> TM.delete corrId sentCommands) get
   where
-    addRequest r@Request {corrId} = TM.insert corrId r sentCommands
-    removeRequest Request {corrId} = TM.delete corrId sentCommands
+    send = sendOrFail $ forM_ rs (\r@Request {corrId} -> TM.insert corrId r sentCommands) >> tryWriteTBQueue sndQ t
+    get sent = if sent then getResponses else withAsync (sendOrFail $ True <$ writeTBQueue sndQ t) (const getResponses)
+    sendOrFail a = atomically $ ifM (readTVar connected) a (True <$ mapM_ failRequest rs)
 
 failRequest :: Request err msg -> STM ()
 failRequest Request {pending, responseVar} =
@@ -1440,7 +1435,6 @@ mkTransmission_ ProtocolClient {thParams, client_ = PClient {clientCorrId}} nonc
   where
     mkRequest :: CorrId -> IO (Request err msg)
     mkRequest corrId = do
-      createdAt <- getCurrentTime
       pending <- newTVarIO True
       responseVar <- newEmptyTMVarIO
       let r =
@@ -1448,7 +1442,6 @@ mkTransmission_ ProtocolClient {thParams, client_ = PClient {clientCorrId}} nonc
               { corrId,
                 entityId,
                 command,
-                createdAt,
                 pending,
                 responseVar
               }
