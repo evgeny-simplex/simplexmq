@@ -33,6 +33,7 @@ module Simplex.Messaging.Agent.Store.AgentStore
     setUserDeleted,
     deleteUserWithoutConns,
     deleteUsersWithoutConns,
+    pgdelUserConns,
     checkUser,
 
     -- * Client services
@@ -429,6 +430,11 @@ deleteUsersWithoutConns db = do
         (Only (BI True))
   forM_ userIds $ DB.execute db "DELETE FROM users WHERE user_id = ?" . Only
   pure userIds
+
+pgdelUserConns :: DB.Connection -> UserId -> IO [(ConnId, Bool, Maybe UTCTime)]
+pgdelUserConns db userId =
+  map (\(connId, BI deleted, waitTs) -> (connId, deleted, waitTs))
+    <$> DB.query db "SELECT conn_id, deleted, deleted_at_wait_delivery FROM connections WHERE user_id = ?" (Only userId)
 
 createClientService :: DB.Connection -> UserId -> SMPServer -> (C.KeyHash, TLS.Credential) -> IO ((C.KeyHash, TLS.Credential), Maybe ServiceId)
 createClientService db userId srv tlsCreds@(kh, (cert, pk)) = do

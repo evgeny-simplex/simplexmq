@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DuplicateRecordFields #-}
@@ -47,6 +48,7 @@ module Simplex.Messaging.Agent
     withInvLock,
     createUser,
     deleteUser,
+    pgdel,
     setUserService,
     connRequestAgentVersion,
     prepareConnectionToCreate,
@@ -178,7 +180,7 @@ import Data.Bifunctor (bimap, first)
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import Data.Composition
-import Data.Either (fromRight, isRight, partitionEithers, rights)
+import Data.Either (fromRight, isRight, lefts, partitionEithers, rights)
 import Data.Foldable (foldl', toList)
 import Data.Functor (($>))
 import Data.Functor.Identity
@@ -195,6 +197,7 @@ import Data.Set (Set)
 import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Encoding (decodeLatin1)
 import Data.Time.Clock
 import Data.Time.Clock.System (systemToUTCTime)
 import Data.Traversable (mapAccumL)
@@ -213,7 +216,7 @@ import Simplex.Messaging.Agent.RetryInterval
 import Simplex.Messaging.Agent.Stats
 import Simplex.Messaging.Agent.Store
 import Simplex.Messaging.Agent.Store.AgentStore
-import Simplex.Messaging.Agent.Store.Common (DBStore)
+import Simplex.Messaging.Agent.Store.Common (DBStore (..))
 import qualified Simplex.Messaging.Agent.Store.DB as DB
 import Simplex.Messaging.Agent.Store.Entity
 import Simplex.Messaging.Agent.Store.Interface (closeDBStore, execSQL, getCurrentMigrations)
@@ -916,8 +919,12 @@ createUser' c useService smp xftp = do
 
 deleteUser' :: AgentClient -> UserId -> Bool -> AM ()
 deleteUser' c@AgentClient {smpServersStats, xftpServersStats} userId delSMPQueues = do
+  pgdel c $ "deleteUser' start u=" <> tshow userId <> " delSMP=" <> tshow delSMPQueues
   if delSMPQueues
-    then withStore c (`setUserDeleted` userId) >>= deleteConnectionsAsync_ delUser c False
+    then do
+      connIds <- withStore c (`setUserDeleted` userId)
+      pgdel c $ "setUserDeleted u=" <> tshow userId <> " conns=" <> tshow (length connIds)
+      delConnsAsync connIds
     else withStore c (`deleteUserRecord` userId)
   atomically $ TM.delete userId $ smpServers c
   atomically $ TM.delete userId $ xftpServers c
@@ -925,10 +932,45 @@ deleteUser' c@AgentClient {smpServersStats, xftpServersStats} userId delSMPQueue
   atomically $ modifyTVar' smpServersStats $ M.filterWithKey (\(userId', _) _ -> userId' /= userId)
   atomically $ modifyTVar' xftpServersStats $ M.filterWithKey (\(userId', _) _ -> userId' /= userId)
   lift $ saveServersStats c
+  pgdel c $ "deleteUser' end u=" <> tshow userId
   where
-    delUser =
-      whenM (withStore' c (`deleteUserWithoutConns` userId)) . atomically $
-        writeTBQueue (subQ c) ("", "", AEvt SAENone $ DEL_USER userId)
+    delConnsAsync connIds = case connIds of
+      [] -> delUser
+      _ -> do
+        (_, rqs, connIds') <- prepareDeleteConnections_ getConns c False connIds
+        withStore' c $ \db -> forM_ connIds' $ setConnDeleted db False
+        holder <- atomically $ tryReadTMVar $ deleteLock c
+        pgdel c $ "prepared u=" <> tshow userId <> " rqs=" <> tshow (length rqs) <> " connIds'=" <> tshow (length connIds') <> " deleteLock holder=" <> tshow holder
+        void . lift . forkIO $ do
+          r <- E.tryAny $ withLock' (deleteLock c) "deleteConnectionsAsync" $ do
+            pgdel c $ "deleteLock acquired u=" <> tshow userId
+            rs <- deleteConnQueues c NRMBackground False True rqs
+            pgdel c $ "deleteConnQueues done u=" <> tshow userId <> " results=" <> tshow (M.elems rs)
+            r' <- runExceptT delUser
+            pgdel c $ "delUser done u=" <> tshow userId <> " result=" <> tshow r'
+          pgdel c $ "forked thread end u=" <> tshow userId <> " result=" <> tshow r
+    delUser = do
+      deleted <- withStore' c (`deleteUserWithoutConns` userId)
+      pgdel c $ "deleteUserWithoutConns u=" <> tshow userId <> " deleted=" <> tshow deleted
+      if deleted
+        then do
+          atomically $ writeTBQueue (subQ c) ("", "", AEvt SAENone $ DEL_USER userId)
+          pgdel c $ "DEL_USER written u=" <> tshow userId
+        else do
+          conns <- withStore' c (`pgdelUserConns` userId)
+          pgdel c $ "remaining conns u=" <> tshow userId <> " conns=" <> tshow conns
+
+pgdel :: MonadIO m => AgentClient -> Text -> m ()
+pgdel c msg = liftIO $ do
+  ts <- getCurrentTime
+  logError $ "PGDEL " <> tshow ts <> " " <> pgdelStore (agentClientStore c) <> " " <> msg
+
+pgdelStore :: DBStore -> Text
+#if defined(dbPostgres)
+pgdelStore DBStore {dbSchema} = decodeLatin1 dbSchema
+#else
+pgdelStore DBStore {dbFilePath} = T.pack dbFilePath
+#endif
 
 setUserService' :: AgentClient -> UserId -> Bool -> AM ()
 setUserService' c userId enable = do
@@ -3067,18 +3109,33 @@ prepareDeleteConnections_ getConnections c waitDelivery connIds = do
 
 deleteConnQueues :: AgentClient -> NetworkRequestMode -> Bool -> Bool -> [RcvQueue] -> AM' (Map ConnId (Either AgentErrorType ()))
 deleteConnQueues c nm waitDelivery ntf rqs = do
-  rs <- connResults <$> (deleteQueueRecs =<< deleteQueues c nm rqs)
+  t0 <- liftIO getCurrentTime
+  qrs <- deleteQueues c nm rqs
+  t1 <- liftIO getCurrentTime
+  let qErrs = [(qConnId rq, e) | (rq, Left e) <- qrs]
+  unless (null qErrs) $ pgdel c $ "deleteConnQueues deleteQueues errors: " <> tshow qErrs
+  rs <- connResults <$> deleteQueueRecs qrs
+  t2 <- liftIO getCurrentTime
   let connIds = M.keys $ M.filter isRight rs
   deliveryTimeout <- if waitDelivery then asks (Just . connDeleteDeliveryTimeout . config) else pure Nothing
-  cIds_ <- L.nonEmpty . catMaybes . rights <$> withStoreBatch' c (\db -> map (deleteConn db deliveryTimeout) connIds)
+  cRs <- withStoreBatch' c (\db -> map (deleteConn db deliveryTimeout) connIds)
+  t3 <- liftIO getCurrentTime
+  let cErrs = lefts cRs
+  unless (null cErrs) $ pgdel c $ "deleteConnQueues deleteConn errors: " <> tshow cErrs
+  when (diffUTCTime t3 t0 > 1) $
+    pgdel c $ "deleteConnQueues slow: rqs=" <> tshow (length rqs) <> " deleteQueues=" <> tshow (diffUTCTime t1 t0) <> " deleteQueueRecs=" <> tshow (diffUTCTime t2 t1) <> " deleteConn=" <> tshow (diffUTCTime t3 t2)
+  let cIds_ = L.nonEmpty . catMaybes $ rights cRs
   forM_ cIds_ $ \cIds -> notify ("", "", AEvt SAEConn $ DEL_CONNS cIds)
   pure rs
   where
     deleteQueueRecs :: [(RcvQueue, Either AgentErrorType ())] -> AM' [(RcvQueue, Either AgentErrorType ())]
     deleteQueueRecs rs = do
       maxErrs <- asks $ deleteErrorCount . config
-      rs' <- rights <$> withStoreBatch' c (\db -> map (deleteQueueRec db maxErrs) rs)
-      let delQ ((rq, _), err_) = (qConnId rq,qServer rq,queueId rq,) <$> err_
+      rRs <- withStoreBatch' c (\db -> map (deleteQueueRec db maxErrs) rs)
+      let rErrs = lefts rRs
+      unless (null rErrs) $ pgdel c $ "deleteQueueRecs errors: " <> tshow rErrs
+      let rs' = rights rRs
+          delQ ((rq, _), err_) = (qConnId rq,qServer rq,queueId rq,) <$> err_
           delQs_ = L.nonEmpty $ mapMaybe delQ rs'
       forM_ delQs_ $ \delQs -> notify ("", "", AEvt SAEConn $ DEL_RCVQS delQs)
       pure $ map fst rs'
@@ -3534,9 +3591,14 @@ cleanupManager c@AgentClient {subQ} = do
     waitActive a = liftIO (E.tryAny $ waitUntilActive c) >>= either (\_ -> pure ()) (\_ -> void a)
     deleteConns =
       withLock (deleteLock c) "cleanupManager" $ do
+        t0 <- liftIO getCurrentTime
         void $ withStore' c getDeletedConnIds >>= deleteDeletedConns c
         void $ withStore' c getDeletedWaitingDeliveryConnIds >>= deleteDeletedWaitingDeliveryConns c
-        withStore' c deleteUsersWithoutConns >>= mapM_ (notify "" . DEL_USER)
+        userIds <- withStore' c deleteUsersWithoutConns
+        t1 <- liftIO getCurrentTime
+        when (not (null userIds) || diffUTCTime t1 t0 > 1) $
+          pgdel c $ "cleanupManager deleteConns users=" <> tshow userIds <> " duration=" <> tshow (diffUTCTime t1 t0)
+        mapM_ (notify "" . DEL_USER) userIds
     deleteRcvFilesExpired = do
       rcvFilesTTL <- asks $ rcvFilesTTL . config
       rcvExpired <- withStore' c (`getRcvFilesExpired` rcvFilesTTL)
